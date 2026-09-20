@@ -1,0 +1,7 @@
+# vulnhunt harness dependencies
+# Install into the `hack` conda env:  conda activate hack && pip install -r requirements.txt
+requests>=2.31
+PyYAML>=6.0
+numpy>=1.24
+# Optional: the official Superlinked SDK (the harness works over raw HTTP without it)
+# sie-sdk

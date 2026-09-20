@@ -1,0 +1,12 @@
+# Copy this file to `config.local.yaml` (which is gitignored) and set the path
+# to the folder that CONTAINS the target repos. That folder lives OUTSIDE this
+# git repo, so the harness never touches or commits the target source.
+#
+# Absolute path:
+#   repos_root: /Users/you/Desktop/pythoncode/hack
+# ...or a path relative to this repo's root (e.g. the parent folder):
+#   repos_root: ".."
+#
+# Precedence (highest first):  --repos-root  >  $VULNHUNT_REPOS_ROOT  >  this file.
+
+repos_root: "/absolute/path/to/folder/containing/the/target/repos"

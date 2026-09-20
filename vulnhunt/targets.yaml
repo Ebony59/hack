@@ -1,0 +1,33 @@
+# Target definitions. `path` is just the folder name; it is resolved under
+# `repos_root` (set in config.local.yaml / --repos-root / $VULNHUNT_REPOS_ROOT),
+# so this file stays machine-independent and the target repos live OUTSIDE this
+# git repo. A `path` may also be an absolute path to override for one target.
+targets:
+  - name: snare
+    path: snare
+    language: rust
+    notes: >
+      GitHub webhooks daemon. Authenticates webhook requests (HMAC signature),
+      then executes a user-defined per-repo program. Focus: signature verify
+      bypass/timing, untrusted payload parsing, command/argument injection.
+
+  - name: pizauth
+    path: pizauth
+    language: rust
+    notes: >
+      OAuth2 token requester daemon. Focus: OAuth state/CSRF handling, the
+      localhost callback HTTP server, token refresh/storage, config parsing.
+
+  - name: vibe-kanban
+    path: vibe-kanban
+    languages: [rust, ts]
+    notes: >
+      Orchestrates coding agents. Large surface. Focus: raw SQL -> SQLi,
+      path traversal, command execution of agents, SSRF, API auth gaps.
+
+  - name: who-targets-me
+    path: Who-Targets-Me
+    language: js
+    notes: >
+      Browser extension collecting political ads. Focus: content-script XSS,
+      message-passing privilege escalation, over-broad permissions, exfil.
