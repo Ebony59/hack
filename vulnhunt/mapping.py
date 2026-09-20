@@ -60,8 +60,7 @@ No extra fields are permitted.
 
 
 def _agent_prompt(role: str, snapshot: dict[str, Any], inventory: dict[str, Any]) -> str:
-    return f"""/no_think
-You are the {role} mapper for a repository-understanding task.
+    return f"""You are the {role} mapper for a repository-understanding task.
 Objective: {ROLE_OBJECTIVES[role]}
 
 {_TOOL_INVENTORY}
@@ -70,6 +69,10 @@ Rules:
 - Distinguish source-code evidence from documentation assertions in the uncertainty field.
 - Do NOT make vulnerability claims. Your job is understanding, not assessment.
 - Navigate from the inventory's entry_point_candidates and manifests; read source files; then call get_evidence to anchor your claims before returning.
+- Tool output is bounded. For source files, request focused read_file ranges of at most 50 lines using start_line and end_line.
+- Never repeat an identical tool request. If a result is truncated, continue with the next explicit line range.
+- The harness permits only three navigation calls. After that, it rejects everything except get_evidence.
+- The harness permits no more than six executed tool calls total. Preserve enough context to return the final MapperResult.
 
 Snapshot: {json.dumps(snapshot, sort_keys=True)}
 Inventory: {json.dumps(inventory, sort_keys=True)[:4000]}
@@ -147,8 +150,7 @@ class SynthesisTooLarge(RuntimeError):
 def run_synthesis(agent: DurableAgent, run_id: str, snapshot, evidence, mapper_results: list[MapperResult],
                   model: str) -> ProjectMap | None:
     """Ask SIE to assemble flow records from mapper artifacts, then validate links."""
-    prompt = f"""/no_think
-You are synthesizing a cited project map from five independent mapper outputs.
+    prompt = f"""You are synthesizing a cited project map from five independent mapper outputs.
 
 Rules:
 - Reuse ONLY entity IDs and evidence IDs that appear in the mapper outputs below. Do NOT invent new ones.

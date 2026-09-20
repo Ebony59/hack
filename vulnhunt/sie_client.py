@@ -41,6 +41,15 @@ class TransportError(InferenceError):
     kind = "transport"
 
 
+class ContextExceededError(InferenceError):
+    kind = "context_exceeded"
+
+    def __init__(self, message: str, *, prompt_tokens: int, context_length: int):
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.context_length = context_length
+
+
 class MalformedResponseError(InferenceError):
     kind = "malformed_response"
 
@@ -96,10 +105,15 @@ class SIEClient:
             raise AuthenticationError("SIE authentication failed")
         if response.status_code == 402:
             raise CreditsError("SIE returned insufficient credits")
+        context_error = _context_exceeded(response)
+        if context_error is not None:
+            raise context_error
         try:
             response.raise_for_status()
         except requests.HTTPError as exc:
-            raise TransportError(f"SIE returned HTTP {response.status_code}") from exc
+            detail = _http_error_detail(response)
+            suffix = f": {detail}" if detail else ""
+            raise TransportError(f"SIE returned HTTP {response.status_code}{suffix}") from exc
         try:
             data = response.json()
         except ValueError as exc:
@@ -141,9 +155,30 @@ class SIEClient:
         chosen = model or self.models["generate"]
         if self.offline:
             return GenerationResult(text=_offline_generate(prompt), model=chosen)
-        data = self._post(f"/v1/generate/{sie_safe_model_id(chosen)}",
-                          {"prompt": prompt, "max_new_tokens": max_new_tokens,
-                           "temperature": temperature, "stream": False}, base=self.generate_url)
+        if chosen.startswith("Qwen/Qwen3.8-"):
+            # Qwen3.8 runs in xhigh thinking mode by default. Its supported
+            # non-thinking control is a chat-template argument; prompt text
+            # such as `/no_think` does not configure this model family.
+            path = "/v1/chat/completions"
+            max_field = "max_tokens"
+            body = {"model": chosen, "messages": [{"role": "user", "content": prompt}],
+                    max_field: max_new_tokens, "temperature": temperature, "stream": False,
+                    "chat_template_kwargs": {"enable_thinking": False}}
+        else:
+            path = f"/v1/generate/{sie_safe_model_id(chosen)}"
+            max_field = "max_new_tokens"
+            body = {"prompt": prompt, max_field: max_new_tokens,
+                    "temperature": temperature, "stream": False}
+        try:
+            data = self._post(path, body, base=self.generate_url)
+        except ContextExceededError as exc:
+            # The server tokenizer is authoritative. Retry once with the exact
+            # remaining window rather than guessing from character counts.
+            adjusted = exc.context_length - exc.prompt_tokens - 128
+            if adjusted < 64 or adjusted >= max_new_tokens:
+                raise
+            body[max_field] = adjusted
+            data = self._post(path, body, base=self.generate_url)
         text = data.get("text")
         if not isinstance(text, str) and isinstance(data.get("choices"), list) and data["choices"]:
             choice = data["choices"][0]
@@ -167,9 +202,20 @@ class SIEClient:
         if self.offline:
             return PreflightResult(ok=False, offline=True, checks=[PreflightCheck(
                 capability="mode", ok=False, detail="offline mode is not valid for real commands")])
+        def probe_generate() -> None:
+            # Qwen reasoning models can spend a tiny completion budget entirely
+            # on private reasoning. ``generate_result`` uses the model family's
+            # supported thinking control before this probe is sent.
+            result = self.generate_result(
+                "Reply with exactly READY.",
+                max_new_tokens=512,
+            )
+            if "READY" not in result.text:
+                raise MalformedResponseError("generation preflight did not return READY")
+
         probes = {"encode": lambda: self.encode(["vulnhunt preflight"]),
                   "score": lambda: self.score("preflight", ["first", "second"]),
-                  "generate": lambda: self.generate_result("Reply with exactly READY.", max_new_tokens=8)}
+                  "generate": probe_generate}
         checks: list[PreflightCheck] = []
         for capability in sorted(required_capabilities):
             if capability not in probes:
@@ -183,6 +229,50 @@ class SIEClient:
             except Exception as exc:
                 checks.append(PreflightCheck(capability=capability, ok=False, detail=f"unexpected: {exc}"))
         return PreflightResult(ok=all(check.ok for check in checks), offline=False, checks=checks)
+
+
+def _http_error_detail(response: requests.Response) -> str | None:
+    """Return a bounded provider error without leaking headers or request data."""
+    try:
+        payload = response.json()
+    except ValueError:
+        text = response.text.strip()
+        return text[:500] or None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = error.get("message")
+        parts = [str(value) for value in (code, message) if value]
+        return ": ".join(parts)[:500] or None
+    if isinstance(error, str):
+        return error[:500]
+    return None
+
+
+def _context_exceeded(response: requests.Response) -> ContextExceededError | None:
+    if response.status_code != 400:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict) or error.get("code") != "context_exceeded":
+        return None
+    message = str(error.get("message") or "SIE context window exceeded")
+    match = re.search(
+        r"prompt_tokens \((\d+)\).*context_length \((\d+)\)",
+        message,
+    )
+    if match is None:
+        return None
+    return ContextExceededError(
+        message,
+        prompt_tokens=int(match.group(1)),
+        context_length=int(match.group(2)),
+    )
 
 
 def parse_json_object(raw: str) -> dict[str, Any] | None:
