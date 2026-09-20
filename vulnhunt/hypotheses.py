@@ -220,7 +220,6 @@ def run_hypothesis_stage(agent: DurableAgent, run_id: str, snapshot, project_map
     # The command reloads previously persisted evidence into the tools before
     # this stage. New get_evidence calls extend the same registry, so both old
     # and newly acquired citations are accepted and persisted by the caller.
-    known_evidence = _known_evidence(agent.tools.evidence.values())
     invariants: list[Invariant] = []
     for flow in selected_flows:
         prompt = _invariant_prompt(flow, agent.tools.evidence.values())
@@ -230,7 +229,12 @@ def run_hypothesis_stage(agent: DurableAgent, run_id: str, snapshot, project_map
         if result is None:
             continue
         try:
-            invariants.extend(_normalize_invariants(snapshot.commit, flow, result, known_evidence))
+            # A bounded agent may have used get_evidence while deriving this
+            # result. Validate against the registry after that task, rather
+            # than the registry as it stood at stage entry.
+            invariants.extend(_normalize_invariants(
+                snapshot.commit, flow, result, _known_evidence(agent.tools.evidence.values())
+            ))
         except ReviewValidationError as exc:
             task.status, task.error_type, task.error_message = "failed", type(exc).__name__, str(exc)
             agent.store.write_json(f"tasks/{task.id}.json", task)
@@ -245,7 +249,11 @@ def run_hypothesis_stage(agent: DurableAgent, run_id: str, snapshot, project_map
         if result is None:
             continue
         try:
-            hypotheses.extend(_normalize_hypotheses(snapshot.commit, flow, invariant, result, known_evidence))
+            # As above, retain legitimate citations created by this task while
+            # still rejecting IDs absent from the durable evidence registry.
+            hypotheses.extend(_normalize_hypotheses(
+                snapshot.commit, flow, invariant, result, _known_evidence(agent.tools.evidence.values())
+            ))
         except ReviewValidationError as exc:
             task.status, task.error_type, task.error_message = "failed", type(exc).__name__, str(exc)
             agent.store.write_json(f"tasks/{task.id}.json", task)

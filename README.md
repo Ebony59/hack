@@ -124,6 +124,31 @@ explicitly approved and names valid flow IDs. `hypothesize` writes cited
 Investigation is refused until checkpoint B is approved; its implementation is
 the next stage. Offline mode is never selected implicitly for this workflow.
 
+### Continue an approved sample run
+
+The sample runs use an explicit, user-chosen run directory, so they do not need
+to be copied under this checkout. Confirm that the pinned target commit is
+still checked out, then invoke the stage with the absolute run path:
+
+```bash
+RUN="$(realpath ../hack/runs/snare/snare-codex)"
+python3.11 -m vulnhunt.cli status --run "$RUN"
+python3.11 -m vulnhunt.cli hypothesize --run "$RUN"
+```
+
+Replace `snare/snare-codex` with the desired `<repo-name>/<repo-name>-codex`.
+This makes real SIE generation calls after preflight and writes checkpoint-B
+artifacts into that same run directory. It will refuse a stale target checkout,
+an unapproved/invalid checkpoint A, or an already-generated checkpoint B.
+
+If a real generation attempt is incomplete (for example, a provider rate-limit
+failure), retry it explicitly. The previous checkpoint-B artifacts, its task
+records, and transcripts are moved under `attempts/`; nothing is discarded:
+
+```bash
+python3.11 -m vulnhunt.cli hypothesize --run "$RUN" --force
+```
+
 ## Legacy region scanner
 
 A bare run scans every repo listed in `config.local.yaml`; `--target NAME`

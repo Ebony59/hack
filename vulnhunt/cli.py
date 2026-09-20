@@ -140,14 +140,51 @@ def _load_stage_five(store: RunStore) -> tuple[list[Invariant], list[Hypothesis]
     return invariants, hypotheses
 
 
+def _current_commit(snapshot: RepositorySnapshot) -> str:
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=snapshot.repo_path, text=True,
+                          capture_output=True, check=False).stdout.strip()
+
+
+def _archive_checkpoint_b(store: RunStore) -> Path:
+    """Preserve a checkpoint-B attempt before an explicitly requested retry."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = store.run_dir / "attempts" / f"checkpoint-b-{timestamp}"
+    archive.mkdir(parents=True, exist_ok=False)
+    moved_task_ids: list[str] = []
+    for path in (store.run_dir / "tasks").glob("*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if record.get("kind") == "hypothesis":
+            moved_task_ids.append(path.stem)
+            destination = archive / "tasks" / path.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            path.replace(destination)
+    for task_id in moved_task_ids:
+        for relative in (f"transcripts/{task_id}.jsonl", f"artifacts/task-{task_id}.json"):
+            source = store.run_dir / relative
+            if source.exists():
+                destination = archive / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source.replace(destination)
+    for relative in ("artifacts/invariants.json", "artifacts/hypotheses.json",
+                     "reviews/checkpoint-b.md", "reviews/checkpoint-b.yaml"):
+        source = store.run_dir / relative
+        if source.exists():
+            destination = archive / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(destination)
+    return archive
+
+
 def command_status(args) -> int:
     try:
         store, snapshot, project_map = _load_run(args.run)
     except (OSError, ValueError, KeyError) as exc:
         print(f"invalid run: {exc}", file=sys.stderr)
         return 2
-    current = subprocess.run(["git", "rev-parse", "HEAD"], cwd=snapshot.repo_path, text=True,
-                             capture_output=True, check=False).stdout.strip()
+    current = _current_commit(snapshot)
     counts = {}
     for path in (store.run_dir / "tasks").glob("*.json"):
         status = json.loads(path.read_text())["status"]
@@ -197,9 +234,20 @@ def command_hypothesize(args) -> int:
     except (OSError, ValueError, KeyError) as exc:
         print(f"checkpoint A is invalid; refusing hypothesis generation: {exc}", file=sys.stderr)
         return 2
-    if (store.run_dir / "artifacts/hypotheses.json").exists():
-        print("Checkpoint B already exists; render or review it instead of regenerating hypotheses.", file=sys.stderr)
+    retrying = (store.run_dir / "artifacts/hypotheses.json").exists()
+    if retrying:
+        if not args.force:
+            print("Checkpoint B already exists; render or review it instead of regenerating hypotheses. "
+                  "Use --force to archive it and start a new checkpoint-B attempt.", file=sys.stderr)
+            return 2
+    current = _current_commit(snapshot)
+    if current != snapshot.commit:
+        print("snapshot commit no longer matches the target checkout; refusing hypothesis generation. "
+              "Create a new mapped run for the current commit.", file=sys.stderr)
         return 2
+    if retrying:
+        archive = _archive_checkpoint_b(store)
+        print(f"Archived previous checkpoint-B attempt: {archive}")
     tools = AnalysisTools(snapshot.repo_path, snapshot.commit)
     tools.evidence = {item.id: item for item in _load_evidence(store)}
     selected = {flow.id: flow for flow in project_map.flows}
@@ -259,6 +307,8 @@ def main(argv=None) -> int:
         item.add_argument("--run", required=True)
         if name == "hypothesize":
             item.add_argument("--sie-url", default=None)
+            item.add_argument("--force", action="store_true",
+                              help="archive an existing checkpoint-B attempt before retrying")
     args = parser.parse_args(argv)
     return {"preflight": command_preflight, "map": command_map, "status": command_status,
             "render": command_render, "hypothesize": command_hypothesize,
