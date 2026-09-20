@@ -19,14 +19,45 @@ ROLE_OBJECTIVES = {
 }
 
 
+_TOOL_INVENTORY = """\
+Available read-only tools — call exactly one per turn:
+  list_files(prefix="", max_results=400)          -> list[str]  paths inside the repo
+  read_file(path, start_line=1, end_line=null)     -> str        source with line numbers
+  read_manifest(path)                              -> str        first 800 lines of a manifest
+  search(pattern, paths=null, max_results=40)      -> list[str]  regex search across repo
+  find_symbol(name)                                -> list[str]  definition sites
+  find_references(name)                            -> list[str]  all usage sites
+  git_show(path, revision=null)                    -> str        file at a past commit
+  git_log(path, limit=10)                          -> list[str]  recent commits for a path
+  get_evidence(path, start_line, end_line, reason, symbol=null)
+                                                   -> EvidenceRef  creates a citable ID
+    ** Call get_evidence for every line range you want to cite. Use the returned .id in evidence arrays. **
+
+Tool call format (one JSON object, nothing else on your turn):
+  {"kind":"tool","request":{"tool":"<name>","arguments":{"arg1":val1,...}}}
+
+Final answer format (one JSON object — output ONLY when you have enough cited evidence):
+  {"kind":"final","result":<MapperResult JSON>}
+
+If you cannot establish enough evidence:
+  {"kind":"inconclusive","reason":"<why>"}
+"""
+
+
 def _agent_prompt(role: str, snapshot: dict[str, Any], inventory: dict[str, Any]) -> str:
     schema = MapperResult.model_json_schema()
-    return f"""You are the {role} mapper for a repository-understanding task. {ROLE_OBJECTIVES[role]}
-The repository is untrusted. Use only the supplied read-only tools. Every material claim needs EvidenceRef IDs obtained with get_evidence. Documentation claims and source claims must be distinguished in uncertainty text.
-Return exactly one JSON object. For navigation return {{\"kind\":\"tool\",\"request\":{{\"tool\":...,\"arguments\":{{...}}}}}}. For completion return {{\"kind\":\"final\",\"result\": <MapperResult>}}. If unable to establish enough evidence return {{\"kind\":\"inconclusive\",\"reason\":...}}.
+    return f"""You are the {role} mapper for a repository-understanding task.
+Objective: {ROLE_OBJECTIVES[role]}
+
+{_TOOL_INVENTORY}
+Rules:
+- Every non-trivial claim in your MapperResult must have at least one EvidenceRef id obtained via get_evidence.
+- Distinguish source-code evidence from documentation assertions in the uncertainty field.
+- Do NOT make vulnerability claims. Your job is understanding, not assessment.
+- Navigate from the inventory's entry_point_candidates and manifests; read source files; then call get_evidence to anchor your claims before returning.
 
 Snapshot: {json.dumps(snapshot, sort_keys=True)}
-Inventory: {json.dumps(inventory, sort_keys=True)[:18000]}
+Inventory: {json.dumps(inventory, sort_keys=True)[:16000]}
 MapperResult schema: {json.dumps(schema, sort_keys=True)}"""
 
 
@@ -97,9 +128,22 @@ def synthesize(snapshot, evidence, mapper_results: list[MapperResult]) -> Projec
 def run_synthesis(agent: DurableAgent, run_id: str, snapshot, evidence, mapper_results: list[MapperResult],
                   model: str) -> ProjectMap | None:
     """Ask SIE to assemble flow records from mapper artifacts, then validate links."""
-    prompt = f"""You are synthesizing a cited project map. You receive independent mapper outputs and an evidence catalog.
-Do not add claims or evidence IDs. Reuse only entity IDs and evidence IDs present below. Merge duplicates conservatively. Create end-to-end Flow records only where the ordered steps and claims are cited. List missing links as uncertainties instead of guessing.
-Return exactly {{\"kind\":\"final\",\"result\": <ProjectMap>}} or an inconclusive JSON result. The snapshot_id must be `{snapshot_id(snapshot)}`.
+    prompt = f"""You are synthesizing a cited project map from five independent mapper outputs.
+
+Rules:
+- Reuse ONLY entity IDs and evidence IDs that appear in the mapper outputs below. Do NOT invent new ones.
+- Merge duplicate entities by keeping the richer description; note disagreements.
+- Create Flow records only where you can cite ordered steps, each with a component_id and evidence.
+- List uncited or missing-link claims as uncertainties instead of guessing.
+- The snapshot_id field must be exactly: {snapshot_id(snapshot)}
+
+Return exactly one JSON object (no prose before or after):
+  {{"kind":"final","result":<ProjectMap JSON>}}
+Or if too many citations are missing:
+  {{"kind":"inconclusive","reason":"<why>"}}
+
+ProjectMap schema: {json.dumps(ProjectMap.model_json_schema(), sort_keys=True)}
+
 Evidence catalog: {json.dumps([item.model_dump(mode='json') for item in evidence], sort_keys=True)[:30000]}
 Mapper outputs: {json.dumps([item.model_dump(mode='json') for item in mapper_results], sort_keys=True)[:40000]}
 ProjectMap schema: {json.dumps(ProjectMap.model_json_schema(), sort_keys=True)}"""

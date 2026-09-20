@@ -28,7 +28,7 @@ class DurableAgent:
         seen_calls: set[str] = set()
         for step in range(self.max_steps):
             try:
-                generated = self.client.generate_result(conversation, max_new_tokens=1400, temperature=0.0)
+                generated = self.client.generate_result(conversation, max_new_tokens=3000, temperature=0.0)
             except Exception as exc:
                 task.status, task.error_type, task.error_message = "failed", type(exc).__name__, str(exc)
                 return self._finish(task, None)
