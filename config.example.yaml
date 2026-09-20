@@ -1,12 +1,21 @@
-# Copy this file to `config.local.yaml` (which is gitignored) and set the path
-# to the folder that CONTAINS the target repos. That folder lives OUTSIDE this
-# git repo, so the harness never touches or commits the target source.
+# Copy this file to `config.local.yaml` (gitignored) and list the target repos
+# to scan. These paths live OUTSIDE this git repo, so the harness never touches
+# or commits the target source. Each teammate keeps their own config.local.yaml.
 #
-# Absolute path:
-#   repos_root: /Users/you/Desktop/pythoncode/hack
-# ...or a path relative to this repo's root (e.g. the parent folder):
-#   repos_root: ".."
-#
-# Precedence (highest first):  --repos-root  >  $VULNHUNT_REPOS_ROOT  >  this file.
+# Simplest form -- a list of paths (absolute, or relative to this repo root).
+# Language and notes are taken from vulnhunt/targets.yaml by folder name when it
+# matches; otherwise the language is auto-detected from the files.
+repos:
+  - "/absolute/path/to/repo-one"
+  - "/absolute/path/to/repo-two"
 
-repos_root: "/absolute/path/to/folder/containing/the/target/repos"
+# You can also give per-repo overrides instead of a bare string:
+# repos:
+#   - path: "/absolute/path/to/repo-three"
+#     name: my-target            # defaults to the folder name
+#     language: rust             # or  languages: [rust, ts]
+#     notes: "what to focus on"
+#
+# Alternative (old) style -- a single root folder that contains repos named in
+# targets.yaml. Overridden by --repos-root or $VULNHUNT_REPOS_ROOT.
+# repos_root: "/absolute/path/to/folder/containing/the/target/repos"

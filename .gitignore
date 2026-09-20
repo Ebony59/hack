@@ -1,6 +1,9 @@
 # Local, machine-specific repo path (each teammate sets their own)
 config.local.yaml
 
+# Secrets / env (holds the SIE API key)
+.env
+
 # Harness output
 out/
 findings-*.md

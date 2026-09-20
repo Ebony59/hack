@@ -1,89 +1,110 @@
 # vulnhunt — SIE-driven vulnerability discovery harness
 
-An autonomous vulnerability-discovery system for the hackathon. It scans a target
-repo, retrieves the riskiest code regions, **fans out one investigator agent per
-region on a self-hosted Superlinked SIE server**, forces each agent to emit a
-structured finding, verifies candidates with real tools, then aggregates and
-reports. The harness is only orchestration — every unit of vulnerability
-*reasoning* runs on SIE, not on Claude/Codex sub-agents.
+An autonomous vulnerability-discovery system. It scans a target repository,
+retrieves the riskiest code regions, **fans out one investigator agent per region
+on a self-hosted Superlinked SIE server**, forces each agent to emit a structured
+finding, verifies candidates with real tools, then aggregates and reports. The
+harness is only orchestration — every unit of vulnerability *reasoning* runs on
+SIE, not on Claude/Codex sub-agents.
 
 ```
 index  ->  retrieve (sink patterns + SIE rerank)  ->  fan out N SIE agents
        ->  SIE structured finding  ->  verify with tools  ->  aggregate  ->  report
 ```
 
-This repo **never contains or touches the target source**. The target repos live
-in a folder you point at via config, so the work is easy to share: teammates
-clone this repo and set their own `repos_root`.
+The target repositories are **not part of this repo**. You list the repos to scan
+in `config.local.yaml`, so this repo stays self-contained and easy to share —
+nothing about the targets is committed here.
 
 ## Layout
 
 ```
-hack/                      <- the folder that holds the target repos (repos_root)
-  snare/  pizauth/  vibe-kanban/  Who-Targets-Me/     <- targets (external, untouched)
-  hack/                    <- THIS git repo
-    README.md
-    requirements.txt
-    config.example.yaml    committed: template for the repos path
-    config.local.yaml      gitignored: your machine's repos path
-    .gitignore
-    vulnhunt/
-      config.py       language adapters + targets + repos_root resolution
-      targets.yaml    the four competition repos (folder names, not paths)
-      sie_client.py   SIE HTTP client (encode/score/extract/generate) + offline fallback
-      indexer.py      walk + line-window chunking with file/line metadata
-      retriever.py    lexical sink scoring + SIE semantic rerank -> candidate regions
-      investigator.py fan-out: one SIE ReAct agent per region  <-- the SIE launch point
-      schema.py       Finding model + JSON schema for structured output
-      tools.py        sandboxed read/grep/run + per-language build/test/lint/semgrep
-      verifier.py     evidence gate: drop unproven candidates, mark verified ones
-      aggregator.py   dedupe by root cause + rank by severity
-      reporter.py     submission-ready markdown + JSON
-      orchestrate.py  the pipeline + CLI
+.                        <- this repo (the harness)
+├── README.md
+├── requirements.txt
+├── config.example.yaml  committed: template for the external repos path
+├── config.local.yaml    gitignored: your machine's repos path
+├── .gitignore
+└── vulnhunt/
+    ├── config.py        language adapters + targets + repos_root resolution
+    ├── targets.yaml      metadata overlay: language + notes per repo name
+    ├── sie_client.py     SIE HTTP client (encode/score/extract/generate) + offline fallback
+    ├── indexer.py        walk + line-window chunking with file/line metadata
+    ├── retriever.py      lexical sink scoring + SIE semantic rerank -> candidate regions
+    ├── investigator.py   fan-out: one SIE ReAct agent per region  <-- the SIE launch point
+    ├── schema.py         Finding model + JSON schema for structured output
+    ├── tools.py          sandboxed read/grep/run + per-language build/test/lint/semgrep
+    ├── verifier.py       evidence gate: drop unproven candidates, mark verified ones
+    ├── aggregator.py     dedupe by root cause + rank by severity
+    ├── reporter.py       submission-ready markdown + JSON
+    └── orchestrate.py    the pipeline + CLI
 ```
 
 ## Setup
 
+From the repo root:
+
 ```bash
 conda activate hack
-cd hack/hack
 pip install -r requirements.txt
 
-# tell the harness where the target repos live:
+# list the target repos to scan:
 cp config.example.yaml config.local.yaml
-# then edit config.local.yaml -> repos_root: ".."   (or an absolute path)
+# then edit config.local.yaml:
+#   repos:
+#     - "/absolute/path/to/repo-one"
+#     - "/absolute/path/to/repo-two"
 ```
 
-`repos_root` is resolved by precedence: `--repos-root` > `$VULNHUNT_REPOS_ROOT` >
-`config.local.yaml`. A relative value is resolved against this repo's root, so
-`".."` means "the folder one level up holds the target repos".
+Each entry is a repo path (absolute, or relative to this repo root). A repo's
+language and notes are taken from `vulnhunt/targets.yaml` when the folder name
+matches; otherwise the language is auto-detected. For per-repo overrides, an
+entry may be a mapping with `path`, `name`, `language`/`languages`, and `notes`
+(see `config.example.yaml`). A single `--repos-root PATH` (or
+`$VULNHUNT_REPOS_ROOT`) still works as an override that scans every target in
+`targets.yaml` under that folder.
 
-## Run SIE (self-hosted, separate terminal)
+## Connect SIE
+
+The reasoning engine is Superlinked SIE. Two ways to reach it — the client
+auto-selects based on whether `SIE_API_KEY` is set.
+
+**Cloud (recommended).** Create a key at `console.superlinked.com`, then:
 
 ```bash
-docker run -p 8080:8080 -v sie-hf-cache:/app/.cache/huggingface \
-  ghcr.io/superlinked/sie-server:latest-cpu-default
-curl localhost:8080/readyz
+cp .env.example .env      # put your sk-sie-... key in it
+source .env               # sets SIE_API_KEY + SIE_BASE_URL
 ```
 
-Point the harness at it with `SIE_URL` (default `http://localhost:8080`). Model
-choices are overridable via env: `SIE_ENCODE_MODEL`, `SIE_SCORE_MODEL`,
-`SIE_EXTRACT_MODEL`, `SIE_GENERATE_MODEL` (a code-capable instruct model such as
-`Qwen/Qwen2.5-Coder-7B-Instruct` is strongly preferred for the agent loop).
+**Local (no key; Apple Silicon friendly).**
+
+```bash
+pip install "sie-server[local]"          # Python 3.12
+sie-server serve                         # encode/score/extract on :8080
+# generation runs separately via MLX:
+uvx --with "mlx-lm>=0.30.7" --from sie-server sie-server serve -b sglang -p 8081
+export SIE_BASE_URL=http://localhost:8080
+export SIE_GENERATE_URL=http://localhost:8081
+```
+
+Model choices are overridable via env (`SIE_GENERATE_MODEL`, `SIE_ENCODE_MODEL`,
+`SIE_SCORE_MODEL`, `SIE_EXTRACT_MODEL`); browse `superlinked.com/models`. A
+code-capable instruct model is strongly preferred for the agent loop. If a call
+returns `402 INSUFFICIENT_CREDITS`, ask the organizers to top up the key.
 
 ## Run the harness
 
+A bare run scans every repo listed in `config.local.yaml`; `--target NAME`
+scans just one (matched by folder name).
+
 ```bash
 # offline dry run — no SIE needed, exercises the whole pipeline end to end
-python -m vulnhunt.orchestrate --target snare --offline
+python -m vulnhunt.orchestrate --offline
 
 # real runs against SIE
-python -m vulnhunt.orchestrate --target snare
-python -m vulnhunt.orchestrate --target vibe-kanban --top 15 --concurrency 6
-python -m vulnhunt.orchestrate --all --semgrep
-
-# repos somewhere else? override without editing config:
-python -m vulnhunt.orchestrate --target snare --repos-root /path/to/repos
+python -m vulnhunt.orchestrate                       # all listed repos
+python -m vulnhunt.orchestrate --target <target-name>
+python -m vulnhunt.orchestrate --top 15 --concurrency 6 --semgrep
 ```
 
 Reports land in `out/findings-<target>.{md,json}` (gitignored).

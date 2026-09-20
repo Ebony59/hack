@@ -80,16 +80,18 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = load_config(args.targets_file, repos_root=args.repos_root)
-    print(f"[config] repos_root = {cfg.repos_root}")
+    print(f"[config] {len(cfg.targets)} target(s): "
+          + ", ".join(f"{t.name}[{','.join(t.languages) or '?'}]" for t in cfg.targets))
     sie = SIEClient(base_url=args.sie_url, offline=(True if args.offline else None))
 
-    if args.all:
-        targets = cfg.targets
-    elif args.target:
+    if args.target:
         targets = [cfg.target(args.target)]
     else:
-        print("Specify --target <name> or --all. Known targets: "
-              + ", ".join(t.name for t in cfg.targets))
+        # No --target: scan every repo in the configured list (that's the point
+        # of the repos: list). --all is kept as an explicit synonym.
+        targets = cfg.targets
+    if not targets:
+        print("No targets configured. Add a `repos:` list to config.local.yaml.")
         return 2
 
     all_findings: List[Finding] = []

@@ -25,45 +25,73 @@ import requests
 
 
 # Default model choices. Override via env or constructor for stronger models.
+# Model defaults. Browse the catalog at superlinked.com/models (or the console
+# playground) and override any of these via env.
 DEFAULT_MODELS = {
-    "encode": os.environ.get("SIE_ENCODE_MODEL", "BAAI/bge-m3"),
-    "score":  os.environ.get("SIE_SCORE_MODEL",  "BAAI/bge-reranker-v2-m3"),
-    "extract": os.environ.get("SIE_EXTRACT_MODEL", "urchade/gliner_multi-v2.1"),
+    "encode":   os.environ.get("SIE_ENCODE_MODEL",   "Qwen/Qwen3-Embedding-4B"),
+    "score":    os.environ.get("SIE_SCORE_MODEL",    "BAAI/bge-reranker-v2-m3"),
+    "extract":  os.environ.get("SIE_EXTRACT_MODEL",  "urchade/gliner_multi-v2.1"),
     # A code-capable instruct model is strongly preferred for the agent loop:
     "generate": os.environ.get("SIE_GENERATE_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct"),
 }
 
+# Cloud (managed) base URL; override with --sie-url or $SIE_BASE_URL / $SIE_URL.
+CLOUD_BASE_URL = "https://api.superlinked.com"
+
 
 class SIEClient:
+    """Works against the managed cloud (api.superlinked.com, needs $SIE_API_KEY)
+    or a local `sie-server` (http://localhost:8080, no key). For a local setup
+    where generation runs as a separate MLX server, set $SIE_GENERATE_URL
+    (e.g. http://localhost:8081); it defaults to the base URL otherwise.
+    """
     def __init__(self, base_url: Optional[str] = None, offline: Optional[bool] = None,
-                 timeout: float = 120.0, models: Optional[Dict[str, str]] = None):
-        self.base_url = (base_url or os.environ.get("SIE_URL", "http://localhost:8080")).rstrip("/")
+                 timeout: float = 120.0, models: Optional[Dict[str, str]] = None,
+                 api_key: Optional[str] = None):
+        self.api_key = api_key or os.environ.get("SIE_API_KEY")
+        env_url = os.environ.get("SIE_BASE_URL") or os.environ.get("SIE_URL")
+        # Default to cloud when a key is present, else a local server.
+        default_url = CLOUD_BASE_URL if self.api_key else "http://localhost:8080"
+        self.base_url = (base_url or env_url or default_url).rstrip("/")
+        self.generate_url = (os.environ.get("SIE_GENERATE_URL") or self.base_url).rstrip("/")
         self.timeout = timeout
         self.models = {**DEFAULT_MODELS, **(models or {})}
         self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json",
-                                     "Content-Type": "application/json"})
-        # Decide online/offline once.
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        self.session.headers.update(headers)
+
         if offline is None:
             offline = not self._ping()
         self.offline = offline
         if self.offline:
-            print(f"[sie] running OFFLINE (server at {self.base_url} not reachable) "
+            why = "no server reachable" + ("" if self.api_key else " and no $SIE_API_KEY set")
+            print(f"[sie] running OFFLINE ({why} at {self.base_url}) "
                   f"-- using local fallbacks for encode/score/generate/extract")
+        else:
+            print(f"[sie] online at {self.base_url}"
+                  + (" (authenticated)" if self.api_key else ""))
 
     # ----- health --------------------------------------------------------- #
     def _ping(self) -> bool:
-        for path in ("/readyz", "/healthz", "/v1/models"):
+        # Authenticated endpoint first when we have a key (cloud), else health.
+        paths = ("/v1/models",) if self.api_key else ("/readyz", "/healthz", "/v1/models")
+        for path in paths:
             try:
-                r = self.session.get(self.base_url + path, timeout=5)
+                r = self.session.get(self.base_url + path, timeout=8)
                 if r.ok:
                     return True
             except requests.RequestException:
                 continue
         return False
 
-    def _post(self, path: str, body: dict) -> dict:
-        r = self.session.post(self.base_url + path, data=json.dumps(body), timeout=self.timeout)
+    def _post(self, path: str, body: dict, base: Optional[str] = None) -> dict:
+        r = self.session.post((base or self.base_url) + path,
+                              data=json.dumps(body), timeout=self.timeout)
+        if r.status_code == 402:
+            raise RuntimeError("SIE returned 402 INSUFFICIENT_CREDITS -- ask the "
+                               "organizers to top up your key.")
         r.raise_for_status()
         return r.json()
 
@@ -103,8 +131,14 @@ class SIEClient:
                 "temperature": temperature, "stream": False}
         if stop:
             body["stop"] = stop
-        out = self._post(f"/v1/generate/{model}", body)
-        return out.get("text", "")
+        out = self._post(f"/v1/generate/{model}", body, base=self.generate_url)
+        # SIE-native returns {"text": ...}; be tolerant of OpenAI-ish shapes too.
+        if "text" in out:
+            return out["text"]
+        if out.get("choices"):
+            ch = out["choices"][0]
+            return ch.get("text") or ch.get("message", {}).get("content", "")
+        return ""
 
     def generate_json(self, prompt: str, schema: dict, max_new_tokens: int = 1024) -> Optional[dict]:
         """Ask the model to emit JSON conforming to `schema`; parse leniently."""

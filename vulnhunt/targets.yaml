@@ -1,7 +1,7 @@
-# Target definitions. `path` is just the folder name; it is resolved under
-# `repos_root` (set in config.local.yaml / --repos-root / $VULNHUNT_REPOS_ROOT),
-# so this file stays machine-independent and the target repos live OUTSIDE this
-# git repo. A `path` may also be an absolute path to override for one target.
+# Metadata overlay for known targets. The repos to scan are listed in
+# config.local.yaml; this file supplies each one's language(s) and notes,
+# matched by folder name. Entries here with no matching repo are simply unused,
+# and a repo with no entry here gets its language auto-detected.
 targets:
   - name: snare
     path: snare
