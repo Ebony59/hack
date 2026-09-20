@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -31,16 +32,17 @@ class DurableAgent:
         self.store.write_json(f"tasks/{task.id}.json", task)
         self.store.append_transcript(task.id, {"type": "prompt", "content": prompt})
         conversation = prompt
-        initial_evidence_ids = set(self.tools.evidence)
+        selected_evidence_ids: set[str] = set()
         seen_calls: set[str] = set()
         repeated_calls: dict[str, int] = {}
+        observations: dict[str, str] = {}
         navigation_calls = 0
         limit_corrections = 0
         for step in range(self.max_steps):
             available = CONTEXT_BUDGET_TOKENS - estimated_tokens(conversation)
             if available < self.min_final_reserve:
-                if set(self.tools.evidence) - initial_evidence_ids:
-                    return self._force_final(task, result_type, prompt, initial_evidence_ids)
+                if selected_evidence_ids:
+                    return self._force_final(task, result_type, prompt, selected_evidence_ids)
                 task.status, task.error_message = "inconclusive", (
                     f"context budget exhausted after {step} steps: only ~{available} tokens "
                     f"remain of {CONTEXT_BUDGET_TOKENS}, below the {self.min_final_reserve} "
@@ -63,12 +65,12 @@ class DurableAgent:
                 if data.get("kind") == "tool":
                     request = AgentToolRequest.model_validate(data)
                     if len(task.tool_calls) >= 6:
-                        return self._force_final(task, result_type, prompt, initial_evidence_ids)
+                        return self._force_final(task, result_type, prompt, selected_evidence_ids)
                     if navigation_calls >= 3 and request.request.tool != "get_evidence":
                         limit_corrections += 1
                         if limit_corrections > 2:
-                            if set(self.tools.evidence) - initial_evidence_ids:
-                                return self._force_final(task, result_type, prompt, initial_evidence_ids)
+                            if selected_evidence_ids:
+                                return self._force_final(task, result_type, prompt, selected_evidence_ids)
                             task.status, task.error_message = "inconclusive", "navigation budget exceeded after correction"
                             return self._finish(task, None)
                         correction = (
@@ -86,8 +88,13 @@ class DurableAgent:
                     if signature in seen_calls:
                         repeated_calls[signature] = repeated_calls.get(signature, 0) + 1
                         if repeated_calls[signature] > 1:
-                            if set(self.tools.evidence) - initial_evidence_ids:
-                                return self._force_final(task, result_type, prompt, initial_evidence_ids)
+                            if selected_evidence_ids:
+                                return self._force_final(task, result_type, prompt, selected_evidence_ids)
+                            recovered_evidence_id = self._capture_repeated_read(
+                                task, request, observations.get(signature))
+                            if recovered_evidence_id:
+                                selected_evidence_ids.add(recovered_evidence_id)
+                                return self._force_final(task, result_type, prompt, selected_evidence_ids)
                             task.status, task.error_message = "inconclusive", "repeated tool call after correction"
                             return self._finish(task, None)
                         correction = (
@@ -106,6 +113,10 @@ class DurableAgent:
                     if request.request.tool != "get_evidence":
                         navigation_calls += 1
                     serialized = observation.model_dump(mode="json") if hasattr(observation, "model_dump") else observation
+                    if request.request.tool == "get_evidence" and isinstance(serialized, dict):
+                        evidence_id = serialized.get("id")
+                        if isinstance(evidence_id, str):
+                            selected_evidence_ids.add(evidence_id)
                     task.tool_calls.append(request.request)
                     self.store.append_transcript(task.id, {"type": "tool", "step": step,
                                                            "tool": request.request.tool, "arguments": request.request.arguments,
@@ -121,33 +132,89 @@ class DurableAgent:
                             f"\n[TRUNCATED: showing {len(bounded)} of {len(rendered)} characters. "
                             "Use read_file with explicit start_line and end_line to continue.]"
                         )
+                    observations[signature] = bounded
                     conversation += "\n\nTOOL OBSERVATION (cite EvidenceRef IDs):\n" + bounded
                     if len(task.tool_calls) >= 6:
-                        return self._force_final(task, result_type, prompt, initial_evidence_ids)
+                        return self._force_final(task, result_type, prompt, selected_evidence_ids)
                     continue
-                final = AgentFinal.model_validate(data)
-                if final.kind == "inconclusive":
+                result = self._validated_result(data, result_type)
+                if result is None:
+                    final = AgentFinal.model_validate(data)
                     task.status, task.error_message = "inconclusive", final.reason or "agent inconclusive"
                     return self._finish(task, None)
-                if final.result is None:
-                    raise ValueError("final response omitted result")
-                result = result_type.model_validate(final.result)
                 task.status, task.usage = "succeeded", generated.usage or {}
                 return self._finish(task, result)
             except (ValidationError, ValueError) as exc:
                 task.status, task.error_type, task.error_message = "failed", "ValidationError", str(exc)
                 return self._finish(task, None)
-        if set(self.tools.evidence) - initial_evidence_ids:
-            return self._force_final(task, result_type, prompt, initial_evidence_ids)
+        if selected_evidence_ids:
+            return self._force_final(task, result_type, prompt, selected_evidence_ids)
         task.status, task.error_message = "inconclusive", "step budget exhausted"
         return self._finish(task, None)
 
+    def _capture_repeated_read(self, task: TaskRecord, request: AgentToolRequest,
+                               observation: str | None) -> str | None:
+        """Turn a repeatedly selected source range into explicit evidence.
+
+        Small instruction-tuned models sometimes repeat a successful read even
+        after being told to cite it. The repeated selection is treated as an
+        intent to cite only the exact numbered lines already shown to the model.
+        """
+        if request.request.tool != "read_file" or not observation:
+            return None
+        line_numbers = [int(match.group(1)) for match in
+                        re.finditer(r"(?m)^\s*(\d+)\|", observation)]
+        if not line_numbers:
+            return None
+        arguments = {
+            "path": request.request.arguments.get("path"),
+            "start_line": min(line_numbers),
+            "end_line": max(line_numbers),
+            "reason": f"Source repeatedly selected as relevant by the {task.role} mapper.",
+        }
+        if not isinstance(arguments["path"], str):
+            return None
+        try:
+            evidence = self.tools.get_evidence(**arguments)
+        except (OSError, ValueError):
+            return None
+        tool_call = ToolCall(tool="get_evidence", arguments=arguments)
+        task.tool_calls.append(tool_call)
+        self.store.append_transcript(task.id, {
+            "type": "tool",
+            "step": "repeated-read-recovery",
+            "tool": tool_call.tool,
+            "arguments": arguments,
+            "result": evidence.model_dump(mode="json"),
+        })
+        return evidence.id
+
+    @staticmethod
+    def _validated_result(data: dict[str, Any], result_type: type[ResultModel]) -> ResultModel | None:
+        """Accept the documented envelope and a strict bare result.
+
+        Some SIE models omit the envelope during forced finalization. A bare
+        object is accepted only if it validates against the requested result
+        model, so this does not weaken field or type validation.
+        """
+        if "kind" not in data:
+            return result_type.model_validate(data)
+        if data.get("kind") == "final" and "result" not in data:
+            flattened = {key: value for key, value in data.items() if key != "kind"}
+            return result_type.model_validate(flattened)
+        final = AgentFinal.model_validate(data)
+        if final.kind == "inconclusive":
+            return None
+        if final.result is None:
+            raise ValueError("final response omitted result")
+        return result_type.model_validate(final.result)
+
     def _force_final(self, task: TaskRecord, result_type: type[ResultModel], original_prompt: str,
-                     initial_evidence_ids: set[str]) -> ResultModel | None:
+                     selected_evidence_ids: set[str]) -> ResultModel | None:
         """Finalize from a fresh bounded evidence prompt after exploration ends."""
         evidence = []
         for evidence_id, item in self.tools.evidence.items():
-            if evidence_id in initial_evidence_ids:
+            if evidence_id not in selected_evidence_ids:
                 continue
             value = item.model_dump(mode="json")
             value["excerpt"] = value["excerpt"][:1000]
@@ -178,11 +245,11 @@ class DurableAgent:
                 "failed", "MalformedResponse", "forced finalization did not return JSON")
             return self._finish(task, None)
         try:
-            final = AgentFinal.model_validate(data)
-            if final.kind != "final" or final.result is None:
+            result = self._validated_result(data, result_type)
+            if result is None:
+                final = AgentFinal.model_validate(data)
                 task.status, task.error_message = "inconclusive", final.reason or "forced finalization inconclusive"
                 return self._finish(task, None)
-            result = result_type.model_validate(final.result)
         except (ValidationError, ValueError) as exc:
             task.status, task.error_type, task.error_message = "failed", "ValidationError", str(exc)
             return self._finish(task, None)

@@ -92,11 +92,13 @@ class SIEClient:
         if self.api_key:
             self.session.headers["Authorization"] = f"Bearer {self.api_key}"
 
-    def _post(self, path: str, body: dict[str, Any], *, base: str | None = None) -> dict[str, Any]:
+    def _post(self, path: str, body: dict[str, Any], *, base: str | None = None,
+              timeout: float | None = None) -> dict[str, Any]:
         if self.offline:
             raise OfflineModeError("offline inference is permitted only in explicitly selected test mode")
         try:
-            response = self.session.post((base or self.base_url) + path, json=body, timeout=self.timeout)
+            response = self.session.post((base or self.base_url) + path, json=body,
+                                         timeout=timeout or self.timeout)
         except requests.Timeout as exc:
             raise TransportError("SIE request timed out") from exc
         except requests.RequestException as exc:
@@ -170,7 +172,11 @@ class SIEClient:
             body = {"prompt": prompt, max_field: max_new_tokens,
                     "temperature": temperature, "stream": False}
         try:
-            data = self._post(path, body, base=self.generate_url)
+            # Large structured generations can legitimately exceed the shorter
+            # encode/score timeout. Avoid retrying a possibly still-running,
+            # billable generation; wait longer for its original response.
+            generation_timeout = max(self.timeout, 300.0)
+            data = self._post(path, body, base=self.generate_url, timeout=generation_timeout)
         except ContextExceededError as exc:
             # The server tokenizer is authoritative. Retry once with the exact
             # remaining window rather than guessing from character counts.
@@ -178,7 +184,7 @@ class SIEClient:
             if adjusted < 64 or adjusted >= max_new_tokens:
                 raise
             body[max_field] = adjusted
-            data = self._post(path, body, base=self.generate_url)
+            data = self._post(path, body, base=self.generate_url, timeout=generation_timeout)
         text = data.get("text")
         if not isinstance(text, str) and isinstance(data.get("choices"), list) and data["choices"]:
             choice = data["choices"][0]

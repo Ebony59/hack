@@ -113,6 +113,32 @@ python3.11 -m vulnhunt.cli status --run runs/snare/<run-id>
 and edit the YAML. Later hypothesis generation is refused unless the review is
 explicitly approved. Offline mode is never selected implicitly for this workflow.
 
+## Reproduce the Who-Targets-Me browser findings
+
+The mapped Who-Targets-Me run includes a browser-level harness for
+`WTM-MAP-01` (page messages reaching privileged extension commands) and
+`WTM-MAP-02` (registration credentials exposed to the page origin):
+
+```bash
+# One-time browser setup. Official Chrome 137+ no longer honors the
+# --load-extension flag; this installs the supported Chrome for Testing build.
+npx --yes @puppeteer/browsers@latest install chrome@stable
+
+# From this repository's root. Installs the target's pinned dependencies,
+# builds with OFFLINE=true, and launches only an isolated Chrome profile.
+node scripts/test-wtm-extension-bridge.mjs --install
+```
+
+Later runs can omit `--install`. Use `--repo PATH` if the Who-Targets-Me
+checkout is not next to this repository, and `--chrome PATH` if Chrome or
+Chromium is not auto-detected. Pass `--headed` to display the temporary Chrome
+window, and `--skip-build` to reuse an existing `build/chrome`. The harness
+serves a synthetic localhost page, uses marker tokens, blocks external DNS
+resolution, and removes its temporary profile after the test. It does not
+contact the production WhoTargetsMe APIs. The browser must be Chrome for
+Testing, Chromium, or an official Chrome older than version 137; current
+official Chrome builds intentionally ignore command-line extension loading.
+
 ## Legacy region scanner
 
 A bare run scans every repo listed in `config.local.yaml`; `--target NAME`

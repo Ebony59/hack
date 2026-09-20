@@ -13,7 +13,7 @@ import yaml
 from .agent import DurableAgent
 from .config import load_config
 from .mapping import SynthesisTooLarge, run_mappers, run_synthesis, synthesize
-from .models import ProjectMap, RepositorySnapshot
+from .models import EvidenceRef, MapperResult, ProjectMap, RepositorySnapshot
 from .preflight import REQUIRED_FOR_MAPPING, run_preflight
 from .reports import render_checkpoint_a
 from .sie_client import SIEClient
@@ -128,6 +128,57 @@ def _load_run(run: str) -> tuple[RunStore, RepositorySnapshot, ProjectMap]:
     return store, snapshot, project_map
 
 
+def command_synthesize(args) -> int:
+    """Resume only synthesis for a run whose mapper artifacts are complete."""
+    store = RunStore(args.run)
+    try:
+        snapshot = RepositorySnapshot.model_validate(store.read_json("snapshot.json"))
+        results = [MapperResult.model_validate(value)
+                   for value in store.read_json("artifacts/mapper-results.json")]
+        evidence = [EvidenceRef.model_validate(json.loads(path.read_text(encoding="utf-8")))
+                    for path in sorted((store.run_dir / "evidence").glob("*.json"))]
+        run_record = store.read_json("run.json")
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"invalid run: {exc}", file=sys.stderr)
+        return 2
+    if not results:
+        print("run has no successful mapper results; synthesis cannot resume.", file=sys.stderr)
+        return 2
+    client = _client(args)
+    preflight = client.preflight({"generate"})
+    if not preflight.ok:
+        print("SIE generation preflight failed; synthesis was not attempted.", file=sys.stderr)
+        for check in preflight.checks:
+            print(f"{'ok' if check.ok else 'FAIL'} {check.capability}: {check.detail}", file=sys.stderr)
+        return 1
+    tools = AnalysisTools(snapshot.repo_path, snapshot.commit)
+    tools.evidence.update({item.id: item for item in evidence})
+    agent = DurableAgent(client, tools, store)
+    try:
+        project_map = run_synthesis(agent, run_record["run_id"], snapshot, evidence, results,
+                                    client.models["generate"])
+    except SynthesisTooLarge as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if project_map is None:
+        print("SIE synthesis failed or produced invalid citations.", file=sys.stderr)
+        return 1
+    store.write_json("artifacts/project-map.json", project_map)
+    store.write_json("artifacts/flows.json", project_map.flows)
+    failed = _failed_tasks(store)
+    markdown, review = render_checkpoint_a(store, snapshot, project_map, failed)
+    store.write_json("run.json", {
+        "schema_version": 1,
+        "run_id": run_record["run_id"],
+        "target": run_record["target"],
+        "status": "mapping_incomplete" if failed else "awaiting_checkpoint_a_review",
+        "watermark": run_record.get("watermark", "SIE-backed mapping"),
+        "snapshot_commit": snapshot.commit,
+    })
+    print(f"Checkpoint A updated: {markdown}\nReview and approve: {review}")
+    return 1 if failed else 0
+
+
 def command_status(args) -> int:
     try:
         store, snapshot, project_map = _load_run(args.run)
@@ -188,11 +239,13 @@ def main(argv=None) -> int:
         item.add_argument("--repos-root", default=None)
         item.add_argument("--sie-url", default=None)
         if name == "map": item.add_argument("--runs-root", default="runs")
-    for name in ("status", "render", "hypothesize", "investigate"):
+    for name in ("status", "render", "hypothesize", "investigate", "synthesize"):
         item = sub.add_parser(name)
         item.add_argument("--run", required=True)
+        if name == "synthesize": item.add_argument("--sie-url", default=None)
     args = parser.parse_args(argv)
-    return {"preflight": command_preflight, "map": command_map, "status": command_status,
+    return {"preflight": command_preflight, "map": command_map, "synthesize": command_synthesize,
+            "status": command_status,
             "render": command_render, "hypothesize": command_hypothesize,
             "investigate": command_investigate}[args.command](args)
 
