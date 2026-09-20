@@ -5,9 +5,9 @@ import json
 from typing import Any
 
 from .agent import DurableAgent
-from .budget import CONTEXT_BUDGET_TOKENS, GENERATION_RESERVE_TOKENS, estimated_tokens
+from .budget import CONTEXT_BUDGET_TOKENS, estimated_tokens
 from .ids import content_hash, stable_id
-from .models import (Actor, Asset, Component, EntryPoint, MapperResult, ProjectMap,
+from .models import (Actor, Asset, Component, EntryPoint, FlowSynthesis, MapperResult, ProjectMap,
                      SecurityControl, TaskRecord, TrustBoundary, utc_now)
 from .snapshot import snapshot_id
 
@@ -147,28 +147,59 @@ class SynthesisTooLarge(RuntimeError):
     """Raised when the synthesis prompt cannot fit the deployment context window."""
 
 
-def run_synthesis(agent: DurableAgent, run_id: str, snapshot, evidence, mapper_results: list[MapperResult],
-                  model: str) -> ProjectMap | None:
-    """Ask SIE to assemble flow records from mapper artifacts, then validate links."""
-    prompt = f"""You are synthesizing a cited project map from five independent mapper outputs.
+SYNTHESIS_RESERVE_TOKENS = 2500
+
+
+def _synthesis_prompt(snapshot, project_map: ProjectMap) -> str:
+    """Build a flow-only prompt without asking the model to echo known data."""
+    entity_catalog = project_map.model_dump(
+        mode="json",
+        exclude={"schema_version", "snapshot_id", "evidence", "flows",
+                 "uncertainties", "disagreements"},
+    )
+    evidence_catalog = [{
+        "id": item.id,
+        "path": item.path,
+        "start_line": item.start_line,
+        "end_line": item.end_line,
+        "reason": item.reason,
+        "excerpt": item.excerpt[:400],
+    } for item in project_map.evidence]
+    return f"""You are synthesizing cited end-to-end flows from an already validated project map.
 
 Rules:
-- Reuse ONLY entity IDs and evidence IDs that appear in the mapper outputs below. Do NOT invent new ones.
-- Merge duplicate entities by keeping the richer description; note disagreements.
-- Create Flow records only where you can cite ordered steps, each with a component_id and evidence.
-- List uncited or missing-link claims as uncertainties instead of guessing.
-- The snapshot_id field must be exactly: {snapshot_id(snapshot)}
+- Use ONLY entity IDs from the entity catalog and evidence IDs from the evidence catalog.
+- Do not repeat or modify components, actors, assets, entry points, boundaries, or controls.
+- Create a flow only when its ordered steps are supported by cited evidence.
+- Put missing links or unresolved claims in uncertainties instead of guessing.
+- The snapshot_id must be exactly: {snapshot_id(snapshot)}
+- No tools are available. Return exactly one JSON object and no prose.
 
-Return exactly one JSON object (no prose before or after):
-  {{"kind":"final","result":<ProjectMap JSON>}}
-Or if too many citations are missing:
+Return:
+  {{"kind":"final","result":{{"snapshot_id":"...","flows":[Flow],"uncertainties":[str],"disagreements":[str]}}}}
+Or:
   {{"kind":"inconclusive","reason":"<why>"}}
 
-ProjectMap schema: {json.dumps(ProjectMap.model_json_schema(), sort_keys=True)}
+Flow fields (all required):
+  id:str, name:str, summary:str, actor_ids:[entity-id], entry_point_id:entity-id,
+  steps:[FlowStep], attacker_inputs:[str], trust_boundary_ids:[entity-id],
+  control_ids:[entity-id], asset_ids:[entity-id], sensitive_operations:[str],
+  deployment_assumptions:[str], open_questions:[str], confidence:number 0..1,
+  evidence:[evidence-id]
+FlowStep fields (all required):
+  component_id:entity-id, action:str, inputs:[str], outputs:[str],
+  evidence:[evidence-id]
 
-Evidence catalog: {json.dumps([item.model_dump(mode='json') for item in evidence], sort_keys=True)[:30000]}
-Mapper outputs: {json.dumps([item.model_dump(mode='json') for item in mapper_results], sort_keys=True)[:40000]}"""
-    needed = estimated_tokens(prompt) + GENERATION_RESERVE_TOKENS
+Entity catalog: {json.dumps(entity_catalog, sort_keys=True)}
+Evidence catalog: {json.dumps(evidence_catalog, sort_keys=True)}"""
+
+
+def run_synthesis(agent: DurableAgent, run_id: str, snapshot, evidence, mapper_results: list[MapperResult],
+                  model: str) -> ProjectMap | None:
+    """Ask SIE for flows, then attach them to the deterministic entity merge."""
+    project_map = synthesize(snapshot, evidence, mapper_results)
+    prompt = _synthesis_prompt(snapshot, project_map)
+    needed = estimated_tokens(prompt) + SYNTHESIS_RESERVE_TOKENS
     if needed > CONTEXT_BUDGET_TOKENS:
         raise SynthesisTooLarge(
             f"synthesis prompt needs ~{needed} tokens but the deployment ceiling is "
@@ -177,23 +208,19 @@ Mapper outputs: {json.dumps([item.model_dump(mode='json') for item in mapper_res
                       kind="mapping", role="synthesis", input_artifact_ids=[snapshot_id(snapshot)],
                       input_hash=content_hash(prompt), model=model, prompt_version="synthesis-v1", status="pending",
                       attempt=0, max_attempts=1, created_at=utc_now())
-    result = agent.run(task, prompt, ProjectMap)
+    result = agent.run(task, prompt, FlowSynthesis)
     if result is None:
         return None
     if result.snapshot_id != snapshot_id(snapshot):
         return None
     valid_evidence = {item.id for item in evidence}
-    component_ids, actor_ids, asset_ids = {item.id for item in result.components}, {item.id for item in result.actors}, {item.id for item in result.assets}
-    entry_ids, boundary_ids, control_ids = {item.id for item in result.entry_points}, {item.id for item in result.trust_boundaries}, {item.id for item in result.controls}
+    component_ids = {item.id for item in project_map.components}
+    actor_ids = {item.id for item in project_map.actors}
+    asset_ids = {item.id for item in project_map.assets}
+    entry_ids = {item.id for item in project_map.entry_points}
+    boundary_ids = {item.id for item in project_map.trust_boundaries}
+    control_ids = {item.id for item in project_map.controls}
     def cited(ids): return bool(ids) and set(ids).issubset(valid_evidence)
-    for group in (result.components, result.actors, result.assets, result.entry_points,
-                  result.trust_boundaries, result.controls):
-        if any(not cited(item.evidence) for item in group):
-            return None
-    if any(not set(item.component_ids).issubset(component_ids) for item in result.entry_points + result.controls):
-        return None
-    if any(not set(item.controls).issubset(control_ids) for item in result.trust_boundaries):
-        return None
     for flow in result.flows:
         if not cited(flow.evidence) or flow.entry_point_id not in entry_ids:
             return None
@@ -202,5 +229,8 @@ Mapper outputs: {json.dumps([item.model_dump(mode='json') for item in mapper_res
             return None
         if any(not cited(step.evidence) or step.component_id not in component_ids for step in flow.steps):
             return None
-    # The model may only reference catalog evidence; it may not alter it.
-    return result.model_copy(update={"evidence": evidence})
+    return project_map.model_copy(update={
+        "flows": result.flows,
+        "uncertainties": [*project_map.uncertainties, *result.uncertainties],
+        "disagreements": [*project_map.disagreements, *result.disagreements],
+    })

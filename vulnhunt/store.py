@@ -12,14 +12,14 @@ import yaml
 from .ids import canonical_json, content_hash
 
 
-def _json_ready(value: Any) -> Any:
-    """Convert nested Pydantic artifacts before handing them to json.dumps."""
+def _json_compatible(value: Any) -> Any:
+    """Recursively convert Pydantic models nested in artifact containers."""
     if hasattr(value, "model_dump"):
-        return _json_ready(value.model_dump(mode="json"))
+        return _json_compatible(value.model_dump(mode="json"))
     if isinstance(value, dict):
-        return {key: _json_ready(item) for key, item in value.items()}
+        return {key: _json_compatible(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_json_ready(item) for item in value]
+        return [_json_compatible(item) for item in value]
     return value
 
 
@@ -48,7 +48,7 @@ class RunStore:
 
     def write_json(self, relative: str, value: Any) -> Path:
         path = self.run_dir / relative
-        payload = _json_ready(value)
+        payload = _json_compatible(value)
         self.atomic_write(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
         return path
 
