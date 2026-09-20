@@ -19,6 +19,7 @@ For a quick read:
 - Read **How to read a run** before inspecting `runs/<target>/<run-id>/`.
 - Read **Discovery results** for the cross-repository review.
 - Read **Who-Targets-Me reproduction** for the strongest evidence produced so far.
+- Read [`WHO_TARGETS_ME_TEST_REPORT.md`](WHO_TARGETS_ME_TEST_REPORT.md) for the standalone test record, harness identity, exact user output, evidence chain, and finding limitations.
 - Read **Current limitations and next steps** before treating any mapping observation as a reportable vulnerability.
 
 Severity in the mapping tables means **potential severity if the stated exposure and attacker prerequisites hold**. It is not a CVSS score and is not proof of exploitability.
