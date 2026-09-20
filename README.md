@@ -96,7 +96,9 @@ returns `402 INSUFFICIENT_CREDITS`, ask the organizers to top up the key.
 
 The supported workflow is deliberately review-gated. Repository understanding
 and mapping use SIE, then stop for a human to review the interaction-flow map.
-It does not generate vulnerability hypotheses or run target commands yet.
+After checkpoint A is approved, SIE derives cited invariants and ranked,
+unverified hypotheses, then stops again at checkpoint B. It does not run target
+commands or investigate hypotheses yet.
 
 ```bash
 # Performs real encode, score, and generation probes. Fails closed on SIE errors.
@@ -107,11 +109,45 @@ python3.11 -m vulnhunt.cli map --target snare
 
 # Inspect immutable task state and pinned-commit status.
 python3.11 -m vulnhunt.cli status --run runs/snare/<run-id>
+
+# After reviewing checkpoint A, generate invariants and checkpoint B.
+python3.11 -m vulnhunt.cli hypothesize --run runs/snare/<run-id>
+
+# Rebuild reports without making SIE calls.
+python3.11 -m vulnhunt.cli render --run runs/snare/<run-id>
 ```
 
 `map` prints `reviews/checkpoint-a.md` and `reviews/checkpoint-a.yaml`. Review
-and edit the YAML. Later hypothesis generation is refused unless the review is
-explicitly approved. Offline mode is never selected implicitly for this workflow.
+and edit the YAML. Hypothesis generation is refused unless the review is
+explicitly approved and names valid flow IDs. `hypothesize` writes cited
+`invariants.json`, ranked `hypotheses.json`, and `reviews/checkpoint-b.*`.
+Investigation is refused until checkpoint B is approved; its implementation is
+the next stage. Offline mode is never selected implicitly for this workflow.
+
+### Continue an approved sample run
+
+The sample runs use an explicit, user-chosen run directory, so they do not need
+to be copied under this checkout. Confirm that the pinned target commit is
+still checked out, then invoke the stage with the absolute run path:
+
+```bash
+RUN="$(realpath ../hack/runs/snare/snare-codex)"
+python3.11 -m vulnhunt.cli status --run "$RUN"
+python3.11 -m vulnhunt.cli hypothesize --run "$RUN"
+```
+
+Replace `snare/snare-codex` with the desired `<repo-name>/<repo-name>-codex`.
+This makes real SIE generation calls after preflight and writes checkpoint-B
+artifacts into that same run directory. It will refuse a stale target checkout,
+an unapproved/invalid checkpoint A, or an already-generated checkpoint B.
+
+If a real generation attempt is incomplete (for example, a provider rate-limit
+failure), retry it explicitly. The previous checkpoint-B artifacts, its task
+records, and transcripts are moved under `attempts/`; nothing is discarded:
+
+```bash
+python3.11 -m vulnhunt.cli hypothesize --run "$RUN" --force
+```
 
 ## Reproduce the Who-Targets-Me browser findings
 
