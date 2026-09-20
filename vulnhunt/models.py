@@ -140,6 +140,78 @@ class ProjectMap(StrictModel):
     disagreements: list[str]
 
 
+class Invariant(StrictModel):
+    """A cited security property that one reviewed interaction flow must preserve."""
+    id: str
+    flow_id: str
+    statement: str = Field(min_length=1)
+    assumptions: list[str]
+    evidence: list[str] = Field(min_length=1)
+
+
+class InvariantResult(StrictModel):
+    """One invariant task may return several independent properties for its flow."""
+    flow_id: str
+    invariants: list[Invariant]
+    uncertainties: list[str] = []
+
+
+class Hypothesis(StrictModel):
+    """A ranked, still-unverified way an attacker might violate an invariant."""
+    id: str
+    flow_id: str
+    invariant_id: str
+    title: str = Field(min_length=1)
+    attacker_capability: str = Field(min_length=1)
+    suspected_path: str = Field(min_length=1)
+    expected_impact: str = Field(min_length=1)
+    evidence: list[str] = Field(min_length=1)
+    contrary_evidence: list[str] = Field(min_length=1)
+    contrary_reasoning: str = Field(min_length=1)
+    decisive_test: str = Field(min_length=1)
+    safety_concerns: list[str]
+    impact: int = Field(ge=1, le=5)
+    reachability: int = Field(ge=1, le=5)
+    evidence_strength: int = Field(ge=1, le=5)
+    novelty: int = Field(ge=1, le=5)
+    reproduction_cost: int = Field(ge=1, le=5)
+    safety_risk: int = Field(ge=1, le=5)
+    priority_score: float = 0.0
+    status: Literal["hypothesis"] = "hypothesis"
+
+
+class HypothesisResult(StrictModel):
+    invariant_id: str
+    hypotheses: list[Hypothesis]
+    uncertainties: list[str] = []
+
+
+class HypothesisSynthesisResult(StrictModel):
+    """A synthesis task may only retain or group existing hypotheses."""
+    kept_hypothesis_ids: list[str]
+    duplicate_groups: list[list[str]] = []
+    uncertainties: list[str] = []
+
+
+class CheckpointAReview(StrictModel):
+    schema_version: Literal[1] = 1
+    approved: bool
+    reviewer_notes: str
+    selected_flow_ids: list[str]
+    rejected_flow_ids: list[str]
+    flow_edits: list[dict[str, Any]]
+    additional_questions: list[str]
+
+
+class CheckpointBReview(StrictModel):
+    schema_version: Literal[1] = 1
+    approved: bool
+    reviewer_notes: str
+    selected_hypothesis_ids: list[str]
+    rejected_hypothesis_ids: list[str]
+    priority_overrides: dict[str, float]
+
+
 class MapperResult(StrictModel):
     """A mapper's bounded contribution; synthesis is the only flow creator."""
     role: str

@@ -96,7 +96,9 @@ returns `402 INSUFFICIENT_CREDITS`, ask the organizers to top up the key.
 
 The supported workflow is deliberately review-gated. Repository understanding
 and mapping use SIE, then stop for a human to review the interaction-flow map.
-It does not generate vulnerability hypotheses or run target commands yet.
+After checkpoint A is approved, SIE derives cited invariants and ranked,
+unverified hypotheses, then stops again at checkpoint B. It does not run target
+commands or investigate hypotheses yet.
 
 ```bash
 # Performs real encode, score, and generation probes. Fails closed on SIE errors.
@@ -107,11 +109,20 @@ python3.11 -m vulnhunt.cli map --target snare
 
 # Inspect immutable task state and pinned-commit status.
 python3.11 -m vulnhunt.cli status --run runs/snare/<run-id>
+
+# After reviewing checkpoint A, generate invariants and checkpoint B.
+python3.11 -m vulnhunt.cli hypothesize --run runs/snare/<run-id>
+
+# Rebuild reports without making SIE calls.
+python3.11 -m vulnhunt.cli render --run runs/snare/<run-id>
 ```
 
 `map` prints `reviews/checkpoint-a.md` and `reviews/checkpoint-a.yaml`. Review
-and edit the YAML. Later hypothesis generation is refused unless the review is
-explicitly approved. Offline mode is never selected implicitly for this workflow.
+and edit the YAML. Hypothesis generation is refused unless the review is
+explicitly approved and names valid flow IDs. `hypothesize` writes cited
+`invariants.json`, ranked `hypotheses.json`, and `reviews/checkpoint-b.*`.
+Investigation is refused until checkpoint B is approved; its implementation is
+the next stage. Offline mode is never selected implicitly for this workflow.
 
 ## Legacy region scanner
 
