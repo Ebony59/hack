@@ -6,10 +6,8 @@
 # Language and notes are taken from vulnhunt/targets.yaml by folder name when it
 # matches; otherwise the language is auto-detected from the files.
 repos:
-  - "/Users/jll/Documents/Projects/hacking/pizauth"
-  - "/Users/jll/Documents/Projects/hacking/snare"
-  - "/Users/jll/Documents/Projects/hacking/vibe-kanban"
-  - "/Users/jll/Documents/Projects/hacking/Who-Targets-Me"
+  - "/absolute/path/to/repo-one"
+  - "/absolute/path/to/repo-two"
 
 # You can also give per-repo overrides instead of a bare string:
 # repos:
