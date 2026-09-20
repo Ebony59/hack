@@ -92,13 +92,34 @@ Model choices are overridable via env (`SIE_GENERATE_MODEL`, `SIE_ENCODE_MODEL`,
 code-capable instruct model is strongly preferred for the agent loop. If a call
 returns `402 INSUFFICIENT_CREDITS`, ask the organizers to top up the key.
 
-## Run the harness
+## Run the staged workflow
+
+The supported workflow is deliberately review-gated. Repository understanding
+and mapping use SIE, then stop for a human to review the interaction-flow map.
+It does not generate vulnerability hypotheses or run target commands yet.
+
+```bash
+# Performs real encode, score, and generation probes. Fails closed on SIE errors.
+python3.11 -m vulnhunt.cli preflight --target snare
+
+# Creates a Git-pinned run, inventory, SIE mapper transcripts, and checkpoint A.
+python3.11 -m vulnhunt.cli map --target snare
+
+# Inspect immutable task state and pinned-commit status.
+python3.11 -m vulnhunt.cli status --run runs/snare/<run-id>
+```
+
+`map` prints `reviews/checkpoint-a.md` and `reviews/checkpoint-a.yaml`. Review
+and edit the YAML. Later hypothesis generation is refused unless the review is
+explicitly approved. Offline mode is never selected implicitly for this workflow.
+
+## Legacy region scanner
 
 A bare run scans every repo listed in `config.local.yaml`; `--target NAME`
 scans just one (matched by folder name).
 
 ```bash
-# offline dry run — no SIE needed, exercises the whole pipeline end to end
+# offline dry run — no SIE needed, exercises legacy plumbing only
 python -m vulnhunt.orchestrate --offline
 
 # real runs against SIE

@@ -84,6 +84,16 @@ def main(argv=None):
           + ", ".join(f"{t.name}[{','.join(t.languages) or '?'}]" for t in cfg.targets))
     sie = SIEClient(base_url=args.sie_url, offline=(True if args.offline else None))
 
+    # Legacy scanner compatibility: do not mistake an unreachable SIE service
+    # for a clean security scan. The staged CLI is the supported workflow.
+    if not args.offline:
+        preflight = sie.preflight({"encode", "score", "generate"})
+        if not preflight.ok:
+            print("[sie] preflight failed; refusing legacy scan.")
+            for check in preflight.checks:
+                print(f"       {'ok' if check.ok else 'FAIL'} {check.capability}: {check.detail}")
+            return 1
+
     if args.target:
         targets = [cfg.target(args.target)]
     else:

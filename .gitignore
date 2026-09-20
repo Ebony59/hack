@@ -6,6 +6,8 @@ config.local.yaml
 
 # Harness output
 out/
+runs/
+evaluation/results/
 findings-*.md
 findings-*.json
 
