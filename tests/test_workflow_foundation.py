@@ -97,6 +97,48 @@ class WorkflowFoundationTests(unittest.TestCase):
         self.assertEqual(normalized.components[0].id,
                          _normalize_ids("a" * 40, result).components[0].id)
 
+    def test_mapper_prompt_fits_the_deployment_context_budget(self):
+        """A mapper request must fit prompt + completion inside the served window.
+
+        Regression guard: an over-large prompt or max_new_tokens is rejected by
+        the endpoint before the model runs, which failed every mapping task.
+        """
+        from vulnhunt.budget import (CONTEXT_BUDGET_TOKENS, GENERATION_RESERVE_TOKENS,
+                                     estimated_tokens)
+        from vulnhunt.mapping import ROLE_OBJECTIVES, _agent_prompt
+
+        snapshot = {"target_id": "t", "commit": "a" * 40, "languages": ["rust"],
+                    "manifests": ["Cargo.toml"], "build_commands": ["cargo build"]}
+        inventory = {"schema_version": 1, "files": [f"src/f{i}.rs" for i in range(40)],
+                     "entry_point_candidates": ["src/main.rs"], "manifests": ["Cargo.toml"]}
+        for role in ROLE_OBJECTIVES:
+            needed = estimated_tokens(_agent_prompt(role, snapshot, inventory)) + GENERATION_RESERVE_TOKENS
+            self.assertLessEqual(needed, CONTEXT_BUDGET_TOKENS,
+                                 f"{role} mapper needs ~{needed} tokens, over the ceiling")
+
+    def test_oversized_synthesis_is_refused_rather_than_sent(self):
+        """Synthesis must fail loudly when it cannot fit, not silently return nothing."""
+        from vulnhunt.mapping import SynthesisTooLarge, run_synthesis
+        from vulnhunt.models import EvidenceRef, MapperResult
+
+        commit = "b" * 40
+        evidence = [EvidenceRef(id=f"ev{i}", repo_commit=commit, path=f"src/f{i}.rs",
+                                start_line=1, end_line=2, symbol=None, content_hash="h" * 8,
+                                reason="r" * 200, excerpt="x" * 400) for i in range(60)]
+        results = [MapperResult(role=r, summary="s" * 500) for r in ("product", "runtime")]
+
+        class _Snap:
+            commit = "b" * 40
+            target_id = "t"
+            config_hash = "c" * 8
+            def model_dump(self, **_):
+                return {"commit": self.commit}
+
+        with self.assertRaises(SynthesisTooLarge) as caught:
+            run_synthesis(None, "run-1", _Snap(), evidence, results, "model-x")
+        self.assertIn("ceiling", str(caught.exception))
+
+
 
 if __name__ == "__main__":
     unittest.main()

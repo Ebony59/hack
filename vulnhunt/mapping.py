@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from .agent import DurableAgent
+from .budget import CONTEXT_BUDGET_TOKENS, GENERATION_RESERVE_TOKENS, estimated_tokens
 from .ids import content_hash, stable_id
 from .models import (Actor, Asset, Component, EntryPoint, MapperResult, ProjectMap,
                      SecurityControl, TaskRecord, TrustBoundary, utc_now)
@@ -43,10 +44,24 @@ If you cannot establish enough evidence:
   {"kind":"inconclusive","reason":"<why>"}
 """
 
+_RESULT_SPEC = """\
+MapperResult fields (omit any list you found nothing for; "ev" = list of get_evidence ids):
+  role: str                summary: str
+  components:       [{id,name,kind,responsibility,evidence:ev,uncertainty:[str]}]
+  actors:           [{id,name,kind,privilege,evidence:ev}]
+  assets:           [{id,name,sensitivity,storage_or_location,evidence:ev}]
+  entry_points:     [{id,name,kind,component_ids:[id],attacker_inputs:[str],evidence:ev}]
+  trust_boundaries: [{id,name,from_domain,to_domain,controls:[id],evidence:ev}]
+  controls:         [{id,name,kind,component_ids:[id],limitations:[str],evidence:ev}]
+  uncertainties: [str]     disagreements: [str]
+Use short slug ids (e.g. "webhook-listener"); they are renormalized afterwards.
+No extra fields are permitted.
+"""
+
 
 def _agent_prompt(role: str, snapshot: dict[str, Any], inventory: dict[str, Any]) -> str:
-    schema = MapperResult.model_json_schema()
-    return f"""You are the {role} mapper for a repository-understanding task.
+    return f"""/no_think
+You are the {role} mapper for a repository-understanding task.
 Objective: {ROLE_OBJECTIVES[role]}
 
 {_TOOL_INVENTORY}
@@ -57,8 +72,8 @@ Rules:
 - Navigate from the inventory's entry_point_candidates and manifests; read source files; then call get_evidence to anchor your claims before returning.
 
 Snapshot: {json.dumps(snapshot, sort_keys=True)}
-Inventory: {json.dumps(inventory, sort_keys=True)[:16000]}
-MapperResult schema: {json.dumps(schema, sort_keys=True)}"""
+Inventory: {json.dumps(inventory, sort_keys=True)[:4000]}
+{_RESULT_SPEC}"""
 
 
 def run_mappers(agent: DurableAgent, run_id: str, snapshot, inventory: dict[str, Any], model: str) -> list[MapperResult]:
@@ -125,10 +140,15 @@ def synthesize(snapshot, evidence, mapper_results: list[MapperResult]) -> Projec
                       flows=[], uncertainties=uncertainties, disagreements=disagreements)
 
 
+class SynthesisTooLarge(RuntimeError):
+    """Raised when the synthesis prompt cannot fit the deployment context window."""
+
+
 def run_synthesis(agent: DurableAgent, run_id: str, snapshot, evidence, mapper_results: list[MapperResult],
                   model: str) -> ProjectMap | None:
     """Ask SIE to assemble flow records from mapper artifacts, then validate links."""
-    prompt = f"""You are synthesizing a cited project map from five independent mapper outputs.
+    prompt = f"""/no_think
+You are synthesizing a cited project map from five independent mapper outputs.
 
 Rules:
 - Reuse ONLY entity IDs and evidence IDs that appear in the mapper outputs below. Do NOT invent new ones.
@@ -145,8 +165,12 @@ Or if too many citations are missing:
 ProjectMap schema: {json.dumps(ProjectMap.model_json_schema(), sort_keys=True)}
 
 Evidence catalog: {json.dumps([item.model_dump(mode='json') for item in evidence], sort_keys=True)[:30000]}
-Mapper outputs: {json.dumps([item.model_dump(mode='json') for item in mapper_results], sort_keys=True)[:40000]}
-ProjectMap schema: {json.dumps(ProjectMap.model_json_schema(), sort_keys=True)}"""
+Mapper outputs: {json.dumps([item.model_dump(mode='json') for item in mapper_results], sort_keys=True)[:40000]}"""
+    needed = estimated_tokens(prompt) + GENERATION_RESERVE_TOKENS
+    if needed > CONTEXT_BUDGET_TOKENS:
+        raise SynthesisTooLarge(
+            f"synthesis prompt needs ~{needed} tokens but the deployment ceiling is "
+            f"{CONTEXT_BUDGET_TOKENS}; SIE synthesis was not attempted")
     task = TaskRecord(id=stable_id("task", snapshot.commit, {"run": run_id, "role": "synthesis"}), run_id=run_id,
                       kind="mapping", role="synthesis", input_artifact_ids=[snapshot_id(snapshot)],
                       input_hash=content_hash(prompt), model=model, prompt_version="synthesis-v1", status="pending",

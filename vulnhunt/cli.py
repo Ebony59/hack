@@ -12,7 +12,7 @@ import yaml
 
 from .agent import DurableAgent
 from .config import load_config
-from .mapping import run_mappers, run_synthesis, synthesize
+from .mapping import SynthesisTooLarge, run_mappers, run_synthesis, synthesize
 from .models import ProjectMap, RepositorySnapshot
 from .preflight import REQUIRED_FOR_MAPPING, run_preflight
 from .reports import render_checkpoint_a
@@ -94,11 +94,17 @@ def command_map(args) -> int:
     evidence = list(tools.evidence.values())
     for item in evidence:
         store.write_json(f"evidence/{item.id}.json", item)
-    project_map = run_synthesis(agent, run_id, snapshot, evidence, results, client.models["generate"])
+    try:
+        project_map = run_synthesis(agent, run_id, snapshot, evidence, results, client.models["generate"])
+        synthesis_note = None if project_map else "SIE synthesis failed or produced invalid citations."
+    except SynthesisTooLarge as exc:
+        project_map, synthesis_note = None, str(exc)
     synthesis_incomplete = project_map is None
     if project_map is None:
         project_map = synthesize(snapshot, evidence, results)
-        project_map.uncertainties.append("SIE synthesis failed or produced invalid citations; rendered conservative mapper merge instead.")
+        project_map.uncertainties.append(
+            f"{synthesis_note} Rendered the deterministic mapper merge instead; "
+            "flows were not generated and must be added during checkpoint-A review.")
     store.write_json("artifacts/project-map.json", project_map)
     store.write_json("artifacts/flows.json", project_map.flows)
     failed = _failed_tasks(store)

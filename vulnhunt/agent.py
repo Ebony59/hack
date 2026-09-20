@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from .ids import canonical_json, content_hash
+from .budget import CONTEXT_BUDGET_TOKENS, estimated_tokens
 from .models import AgentFinal, AgentToolRequest, TaskRecord, ToolCall, utc_now
 from .sie_client import GenerationResult, InferenceClient, parse_json_object
 from .store import RunStore
@@ -16,9 +17,12 @@ ResultModel = TypeVar("ResultModel", bound=BaseModel)
 
 class DurableAgent:
     def __init__(self, client: InferenceClient, tools: AnalysisTools, store: RunStore, *,
-                 max_steps: int = 10, output_limit: int = 7000):
+                 max_steps: int = 12, output_limit: int = 1200,
+                 final_answer_reserve: int = 1400, min_final_reserve: int = 700):
         self.client, self.tools, self.store = client, tools, store
         self.max_steps, self.output_limit = max_steps, output_limit
+        self.final_answer_reserve = final_answer_reserve
+        self.min_final_reserve = min_final_reserve
 
     def run(self, task: TaskRecord, prompt: str, result_type: type[ResultModel]) -> ResultModel | None:
         task.status, task.started_at = "running", utc_now()
@@ -27,8 +31,16 @@ class DurableAgent:
         conversation = prompt
         seen_calls: set[str] = set()
         for step in range(self.max_steps):
+            available = CONTEXT_BUDGET_TOKENS - estimated_tokens(conversation)
+            if available < self.min_final_reserve:
+                task.status, task.error_message = "inconclusive", (
+                    f"context budget exhausted after {step} steps: only ~{available} tokens "
+                    f"remain of {CONTEXT_BUDGET_TOKENS}, below the {self.min_final_reserve} "
+                    "needed to emit a final result")
+                return self._finish(task, None)
+            budget = min(self.final_answer_reserve, available)
             try:
-                generated = self.client.generate_result(conversation, max_new_tokens=3000, temperature=0.0)
+                generated = self.client.generate_result(conversation, max_new_tokens=budget, temperature=0.0)
             except Exception as exc:
                 task.status, task.error_type, task.error_message = "failed", type(exc).__name__, str(exc)
                 return self._finish(task, None)
