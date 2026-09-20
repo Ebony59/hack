@@ -46,6 +46,8 @@ def main(argv=None):
     ap.add_argument("--offline", action="store_true")
     args = ap.parse_args(argv)
 
+    failures = []
+
     print("== 1. SIE connection ==")
     sie = SIEClient(base_url=args.sie_url, offline=(True if args.offline else None))
     print(f"       base={sie.base_url}  generate={sie.generate_url}  "
@@ -58,6 +60,7 @@ def main(argv=None):
         _ok("encode -> dim", len(v[0]))
     except Exception as e:
         _fail("encode", e)
+        failures.append("encode")
 
     print("== 3. score (rerank) ==")
     try:
@@ -66,6 +69,7 @@ def main(argv=None):
         _ok("score ->", [round(x, 3) for x in s])
     except Exception as e:
         _fail("score", e)
+        failures.append("score")
 
     print("== 4. generate (tiny) ==")
     try:
@@ -73,6 +77,7 @@ def main(argv=None):
         _ok("generate ->", repr((out or "").strip()[:40]))
     except Exception as e:
         _fail("generate", e)
+        failures.append("generate")
 
     print("== 5. one investigator agent on one region ==")
     try:
@@ -101,9 +106,10 @@ def main(argv=None):
             print("  [ok]   agent ran; no vulnerability claimed for this region")
     except Exception as e:
         _fail("investigator", e)
+        failures.append("investigator")
 
     print("\nSmoke test done.")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

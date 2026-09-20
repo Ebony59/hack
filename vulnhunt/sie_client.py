@@ -1,15 +1,7 @@
-"""Thin client for a Superlinked SIE server (self-hosted, default :8080).
+"""Typed Superlinked SIE client with explicit failure semantics.
 
-Implements the four primitives over the documented HTTP API:
-    POST /v1/encode/:model     -> dense embeddings
-    POST /v1/score/:model      -> rerank
-    POST /v1/extract/:model    -> structured extraction
-    POST /v1/generate/:model   -> text generation
-
-If the server is unreachable and `offline=True` (or auto-detected), the client
-falls back to deterministic local stand-ins so the whole pipeline still runs
-end to end for development. Fallbacks are clearly marked and never fabricate a
-"verified" vulnerability -- they only keep the plumbing testable.
+Legacy ``generate``/``score`` calls remain available. New staged commands use
+``preflight`` and ``generate_result``. Offline responses are explicit test mode.
 """
 from __future__ import annotations
 
@@ -18,207 +10,301 @@ import json
 import math
 import os
 import re
-import time
-from typing import Any, Dict, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol, Sequence
 
 import requests
 
+from .models import PreflightCheck, PreflightResult
 
-# Default model choices. Override via env or constructor for stronger models.
-# Model defaults. Browse the catalog at superlinked.com/models (or the console
-# playground) and override any of these via env.
 DEFAULT_MODELS = {
-    "encode":   os.environ.get("SIE_ENCODE_MODEL",   "Qwen/Qwen3-Embedding-4B"),
-    "score":    os.environ.get("SIE_SCORE_MODEL",    "BAAI/bge-reranker-v2-m3"),
-    "extract":  os.environ.get("SIE_EXTRACT_MODEL",  "urchade/gliner_multi-v2.1"),
-    # A code-capable instruct model is strongly preferred for the agent loop:
+    "encode": os.environ.get("SIE_ENCODE_MODEL", "Qwen/Qwen3-Embedding-4B"),
+    "score": os.environ.get("SIE_SCORE_MODEL", "BAAI/bge-reranker-v2-m3"),
     "generate": os.environ.get("SIE_GENERATE_MODEL", "Qwen/Qwen2.5-Coder-7B-Instruct"),
 }
-
-# Cloud (managed) base URL; override with --sie-url or $SIE_BASE_URL / $SIE_URL.
 CLOUD_BASE_URL = "https://api.superlinked.com"
 
 
+class InferenceError(RuntimeError):
+    kind = "inference"
+
+
+class AuthenticationError(InferenceError):
+    kind = "authentication"
+
+
+class CreditsError(InferenceError):
+    kind = "insufficient_credits"
+
+
+class TransportError(InferenceError):
+    kind = "transport"
+
+
+class ContextExceededError(InferenceError):
+    kind = "context_exceeded"
+
+    def __init__(self, message: str, *, prompt_tokens: int, context_length: int):
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.context_length = context_length
+
+
+class MalformedResponseError(InferenceError):
+    kind = "malformed_response"
+
+
+class OfflineModeError(InferenceError):
+    kind = "offline"
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    text: str
+    model: str
+    model_revision: str | None = None
+    usage: dict[str, Any] | None = None
+
+
+class InferenceClient(Protocol):
+    def preflight(self, required_capabilities: set[str]) -> PreflightResult: ...
+    def score(self, query: str, items: list[str]) -> list[float]: ...
+    def generate_result(self, prompt: str, *, max_new_tokens: int = 1024,
+                        temperature: float = 0.0) -> GenerationResult: ...
+
+
+def sie_safe_model_id(model: str) -> str:
+    """SIE native routes require a Hugging Face slash encoded as ``__``."""
+    return model.replace("/", "__")
+
+
 class SIEClient:
-    """Works against the managed cloud (api.superlinked.com, needs $SIE_API_KEY)
-    or a local `sie-server` (http://localhost:8080, no key). For a local setup
-    where generation runs as a separate MLX server, set $SIE_GENERATE_URL
-    (e.g. http://localhost:8081); it defaults to the base URL otherwise.
-    """
-    def __init__(self, base_url: Optional[str] = None, offline: Optional[bool] = None,
-                 timeout: float = 120.0, models: Optional[Dict[str, str]] = None,
-                 api_key: Optional[str] = None):
+    def __init__(self, base_url: str | None = None, offline: bool = False, timeout: float = 120.0,
+                 models: dict[str, str] | None = None, api_key: str | None = None):
         self.api_key = api_key or os.environ.get("SIE_API_KEY")
         env_url = os.environ.get("SIE_BASE_URL") or os.environ.get("SIE_URL")
-        # Default to cloud when a key is present, else a local server.
-        default_url = CLOUD_BASE_URL if self.api_key else "http://localhost:8080"
-        self.base_url = (base_url or env_url or default_url).rstrip("/")
+        default = CLOUD_BASE_URL if self.api_key else "http://localhost:8080"
+        self.base_url = (base_url or env_url or default).rstrip("/")
         self.generate_url = (os.environ.get("SIE_GENERATE_URL") or self.base_url).rstrip("/")
-        self.timeout = timeout
-        self.models = {**DEFAULT_MODELS, **(models or {})}
+        self.timeout, self.models, self.offline = timeout, {**DEFAULT_MODELS, **(models or {})}, offline
         self.session = requests.Session()
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        self.session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        self.session.headers.update(headers)
+            self.session.headers["Authorization"] = f"Bearer {self.api_key}"
 
-        if offline is None:
-            offline = not self._ping()
-        self.offline = offline
+    def _post(self, path: str, body: dict[str, Any], *, base: str | None = None,
+              timeout: float | None = None) -> dict[str, Any]:
         if self.offline:
-            why = "no server reachable" + ("" if self.api_key else " and no $SIE_API_KEY set")
-            print(f"[sie] running OFFLINE ({why} at {self.base_url}) "
-                  f"-- using local fallbacks for encode/score/generate/extract")
+            raise OfflineModeError("offline inference is permitted only in explicitly selected test mode")
+        try:
+            response = self.session.post((base or self.base_url) + path, json=body,
+                                         timeout=timeout or self.timeout)
+        except requests.Timeout as exc:
+            raise TransportError("SIE request timed out") from exc
+        except requests.RequestException as exc:
+            raise TransportError(f"SIE transport failure: {exc}") from exc
+        if response.status_code in (401, 403):
+            raise AuthenticationError("SIE authentication failed")
+        if response.status_code == 402:
+            raise CreditsError("SIE returned insufficient credits")
+        context_error = _context_exceeded(response)
+        if context_error is not None:
+            raise context_error
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            detail = _http_error_detail(response)
+            suffix = f": {detail}" if detail else ""
+            raise TransportError(f"SIE returned HTTP {response.status_code}{suffix}") from exc
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise MalformedResponseError("SIE returned non-JSON response") from exc
+        if not isinstance(data, dict):
+            raise MalformedResponseError("SIE response is not an object")
+        return data
+
+    def encode(self, texts: Sequence[str], model: str | None = None) -> list[list[float]]:
+        if self.offline:
+            return [_hash_embed(text) for text in texts]
+        chosen = model or self.models["encode"]
+        data = self._post(f"/v1/encode/{sie_safe_model_id(chosen)}",
+                          {"items": [{"id": str(i), "text": text} for i, text in enumerate(texts)],
+                           "params": {"output_types": ["dense"]}})
+        try:
+            return [item["dense"]["values"] for item in data["items"]]
+        except (KeyError, TypeError) as exc:
+            raise MalformedResponseError("encode response missing dense vectors") from exc
+
+    def score(self, query: str, texts: Sequence[str], model: str | None = None) -> list[float]:
+        if self.offline:
+            vector = _hash_embed(query)
+            return [_cos(vector, _hash_embed(item)) for item in texts]
+        chosen = model or self.models["score"]
+        data = self._post(f"/v1/score/{sie_safe_model_id(chosen)}",
+                          {"query": {"text": query},
+                           "items": [{"id": str(i), "text": text} for i, text in enumerate(texts)]})
+        try:
+            scores = [0.0] * len(texts)
+            for score in data["scores"]:
+                scores[int(score["item_id"])] = float(score["score"])
+            return scores
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            raise MalformedResponseError("score response has invalid items") from exc
+
+    def generate_result(self, prompt: str, *, max_new_tokens: int = 1024,
+                        temperature: float = 0.0, model: str | None = None) -> GenerationResult:
+        chosen = model or self.models["generate"]
+        if self.offline:
+            return GenerationResult(text=_offline_generate(prompt), model=chosen)
+        if chosen.startswith("Qwen/Qwen3.8-"):
+            # Qwen3.8 runs in xhigh thinking mode by default. Its supported
+            # non-thinking control is a chat-template argument; prompt text
+            # such as `/no_think` does not configure this model family.
+            path = "/v1/chat/completions"
+            max_field = "max_tokens"
+            body = {"model": chosen, "messages": [{"role": "user", "content": prompt}],
+                    max_field: max_new_tokens, "temperature": temperature, "stream": False,
+                    "chat_template_kwargs": {"enable_thinking": False}}
         else:
-            print(f"[sie] online at {self.base_url}"
-                  + (" (authenticated)" if self.api_key else ""))
+            path = f"/v1/generate/{sie_safe_model_id(chosen)}"
+            max_field = "max_new_tokens"
+            body = {"prompt": prompt, max_field: max_new_tokens,
+                    "temperature": temperature, "stream": False}
+        try:
+            # Large structured generations can legitimately exceed the shorter
+            # encode/score timeout. Avoid retrying a possibly still-running,
+            # billable generation; wait longer for its original response.
+            generation_timeout = max(self.timeout, 300.0)
+            data = self._post(path, body, base=self.generate_url, timeout=generation_timeout)
+        except ContextExceededError as exc:
+            # The server tokenizer is authoritative. Retry once with the exact
+            # remaining window rather than guessing from character counts.
+            adjusted = exc.context_length - exc.prompt_tokens - 128
+            if adjusted < 64 or adjusted >= max_new_tokens:
+                raise
+            body[max_field] = adjusted
+            data = self._post(path, body, base=self.generate_url, timeout=generation_timeout)
+        text = data.get("text")
+        if not isinstance(text, str) and isinstance(data.get("choices"), list) and data["choices"]:
+            choice = data["choices"][0]
+            text = choice.get("text") or choice.get("message", {}).get("content")
+        if not isinstance(text, str):
+            raise MalformedResponseError("generation response has no text")
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+        return GenerationResult(text=text, model=chosen, model_revision=data.get("model_revision"), usage=usage)
 
-    # ----- health --------------------------------------------------------- #
-    def _ping(self) -> bool:
-        # Authenticated endpoint first when we have a key (cloud), else health.
-        paths = ("/v1/models",) if self.api_key else ("/readyz", "/healthz", "/v1/models")
-        for path in paths:
-            try:
-                r = self.session.get(self.base_url + path, timeout=8)
-                if r.ok:
-                    return True
-            except requests.RequestException:
-                continue
-        return False
-
-    def _post(self, path: str, body: dict, base: Optional[str] = None) -> dict:
-        r = self.session.post((base or self.base_url) + path,
-                              data=json.dumps(body), timeout=self.timeout)
-        if r.status_code == 402:
-            raise RuntimeError("SIE returned 402 INSUFFICIENT_CREDITS -- ask the "
-                               "organizers to top up your key.")
-        r.raise_for_status()
-        return r.json()
-
-    # ----- encode --------------------------------------------------------- #
-    def encode(self, texts: Sequence[str], model: Optional[str] = None) -> List[List[float]]:
-        """Return one dense vector per text."""
-        if self.offline:
-            return [_hash_embed(t) for t in texts]
-        model = model or self.models["encode"]
-        body = {"items": [{"id": str(i), "text": t} for i, t in enumerate(texts)],
-                "params": {"output_types": ["dense"]}}
-        out = self._post(f"/v1/encode/{model}", body)
-        return [item["dense"]["values"] for item in out["items"]]
-
-    # ----- score / rerank ------------------------------------------------- #
-    def score(self, query: str, texts: Sequence[str], model: Optional[str] = None) -> List[float]:
-        """Return a relevance score per text, aligned to input order."""
-        if self.offline:
-            qv = _hash_embed(query)
-            return [_cos(qv, _hash_embed(t)) for t in texts]
-        model = model or self.models["score"]
-        body = {"query": {"text": query},
-                "items": [{"id": str(i), "text": t} for i, t in enumerate(texts)]}
-        out = self._post(f"/v1/score/{model}", body)
-        scores = [0.0] * len(texts)
-        for s in out["scores"]:
-            scores[int(s["item_id"])] = float(s["score"])
-        return scores
-
-    # ----- generate ------------------------------------------------------- #
     def generate(self, prompt: str, max_new_tokens: int = 1024, temperature: float = 0.0,
-                 stop: Optional[List[str]] = None, model: Optional[str] = None) -> str:
+                 stop: list[str] | None = None, model: str | None = None) -> str:
+        return self.generate_result(prompt, max_new_tokens=max_new_tokens, temperature=temperature,
+                                    model=model).text
+
+    def generate_json(self, prompt: str, schema: dict[str, Any], max_new_tokens: int = 1024) -> dict[str, Any] | None:
+        result = self.generate_result(prompt.rstrip() + "\nReturn only a JSON object matching:\n" +
+                                      json.dumps(schema), max_new_tokens=max_new_tokens)
+        return parse_json_object(result.text)
+
+    def preflight(self, required_capabilities: set[str]) -> PreflightResult:
         if self.offline:
-            return _offline_generate(prompt)
-        model = model or self.models["generate"]
-        body = {"prompt": prompt, "max_new_tokens": max_new_tokens,
-                "temperature": temperature, "stream": False}
-        if stop:
-            body["stop"] = stop
-        out = self._post(f"/v1/generate/{model}", body, base=self.generate_url)
-        # SIE-native returns {"text": ...}; be tolerant of OpenAI-ish shapes too.
-        if "text" in out:
-            return out["text"]
-        if out.get("choices"):
-            ch = out["choices"][0]
-            return ch.get("text") or ch.get("message", {}).get("content", "")
-        return ""
+            return PreflightResult(ok=False, offline=True, checks=[PreflightCheck(
+                capability="mode", ok=False, detail="offline mode is not valid for real commands")])
+        def probe_generate() -> None:
+            # Qwen reasoning models can spend a tiny completion budget entirely
+            # on private reasoning. ``generate_result`` uses the model family's
+            # supported thinking control before this probe is sent.
+            result = self.generate_result(
+                "Reply with exactly READY.",
+                max_new_tokens=512,
+            )
+            if "READY" not in result.text:
+                raise MalformedResponseError("generation preflight did not return READY")
 
-    def generate_json(self, prompt: str, schema: dict, max_new_tokens: int = 1024) -> Optional[dict]:
-        """Ask the model to emit JSON conforming to `schema`; parse leniently."""
-        full = (prompt.rstrip()
-                + "\n\nReturn ONLY a JSON object matching this schema (no prose):\n"
-                + json.dumps(schema) + "\n")
-        raw = self.generate(full, max_new_tokens=max_new_tokens, temperature=0.0)
-        return _extract_json(raw)
-
-
-# --------------------------------------------------------------------------- #
-# Offline fallbacks (deterministic, dependency-free)
-# --------------------------------------------------------------------------- #
-
-_DIM = 256
-
-
-def _hash_embed(text: str, dim: int = _DIM) -> List[float]:
-    """A cheap deterministic bag-of-tokens embedding for offline dev."""
-    vec = [0.0] * dim
-    for tok in re.findall(r"[A-Za-z_]{2,}", text.lower()):
-        h = int(hashlib.md5(tok.encode()).hexdigest(), 16)
-        vec[h % dim] += 1.0
-    n = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [v / n for v in vec]
+        probes = {"encode": lambda: self.encode(["vulnhunt preflight"]),
+                  "score": lambda: self.score("preflight", ["first", "second"]),
+                  "generate": probe_generate}
+        checks: list[PreflightCheck] = []
+        for capability in sorted(required_capabilities):
+            if capability not in probes:
+                checks.append(PreflightCheck(capability=capability, ok=False, detail="unknown capability"))
+                continue
+            try:
+                probes[capability]()
+                checks.append(PreflightCheck(capability=capability, ok=True, detail="live probe succeeded"))
+            except InferenceError as exc:
+                checks.append(PreflightCheck(capability=capability, ok=False, detail=f"{exc.kind}: {exc}"))
+            except Exception as exc:
+                checks.append(PreflightCheck(capability=capability, ok=False, detail=f"unexpected: {exc}"))
+        return PreflightResult(ok=all(check.ok for check in checks), offline=False, checks=checks)
 
 
-def _cos(a: List[float], b: List[float]) -> float:
-    return sum(x * y for x, y in zip(a, b))
+def _http_error_detail(response: requests.Response) -> str | None:
+    """Return a bounded provider error without leaking headers or request data."""
+    try:
+        payload = response.json()
+    except ValueError:
+        text = response.text.strip()
+        return text[:500] or None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = error.get("message")
+        parts = [str(value) for value in (code, message) if value]
+        return ": ".join(parts)[:500] or None
+    if isinstance(error, str):
+        return error[:500]
+    return None
+
+
+def _context_exceeded(response: requests.Response) -> ContextExceededError | None:
+    if response.status_code != 400:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict) or error.get("code") != "context_exceeded":
+        return None
+    message = str(error.get("message") or "SIE context window exceeded")
+    match = re.search(
+        r"prompt_tokens \((\d+)\).*context_length \((\d+)\)",
+        message,
+    )
+    if match is None:
+        return None
+    return ContextExceededError(
+        message,
+        prompt_tokens=int(match.group(1)),
+        context_length=int(match.group(2)),
+    )
+
+
+def parse_json_object(raw: str) -> dict[str, Any] | None:
+    """Find a complete JSON object using the JSON decoder, not brace counting."""
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", raw):
+        try:
+            value, _ = decoder.raw_decode(raw[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _hash_embed(text: str, dim: int = 256) -> list[float]:
+    vector = [0.0] * dim
+    for token in re.findall(r"[A-Za-z_]{2,}", text.lower()):
+        vector[int(hashlib.md5(token.encode()).hexdigest(), 16) % dim] += 1
+    size = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / size for value in vector]
+
+
+def _cos(left: list[float], right: list[float]) -> float:
+    return sum(a * b for a, b in zip(left, right))
 
 
 def _offline_generate(prompt: str) -> str:
-    """Very small heuristic stand-in for a served model, so the agent loop and
-    JSON extraction path can be exercised without SIE. It is intentionally
-    conservative: it proposes a low-confidence candidate, never a verified bug.
-    """
-    cls = "unknown"
-    m = re.search(r"vuln[_ ]?class[\"'\s:]+([a-z-]+)", prompt, re.I)
-    if m:
-        cls = m.group(1)
-    stub = {
-        "is_vulnerability": True,
-        "title": f"[offline stub] possible {cls}",
-        "vuln_class": cls,
-        "severity": "Low",
-        "line": 0,
-        "summary": "Offline heuristic stub: SIE was not reachable, so no real "
-                   "analysis was performed. Re-run with SIE up.",
-        "data_flow": "unknown (offline)",
-        "steps": ["Start SIE and re-run to get a real analysis."],
-        "poc": "",
-        "suggested_fix": "",
-        "confidence": 0.15,
-    }
-    return json.dumps(stub)
-
-
-def _extract_json(raw: str) -> Optional[dict]:
-    """Pull the first JSON object out of a model response."""
-    if not raw:
-        return None
-    # Fenced block first.
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S)
-    candidate = m.group(1) if m else None
-    if candidate is None:
-        start = raw.find("{")
-        if start == -1:
-            return None
-        depth = 0
-        for i in range(start, len(raw)):
-            if raw[i] == "{":
-                depth += 1
-            elif raw[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = raw[start:i + 1]
-                    break
-    if not candidate:
-        return None
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
+    return json.dumps({"kind": "inconclusive", "reason": "explicit offline test mode; no SIE reasoning"})
