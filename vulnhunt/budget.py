@@ -1,17 +1,20 @@
-"""Context-window budgeting for the deployed SIE generation endpoint.
+"""Token budgeting for the default SIE generation deployments.
 
-The generation endpoint reserves ``prompt + max_new_tokens`` against a fixed
-window, so an over-large ``max_new_tokens`` fails the request before the model
-runs. The catalogued ``:h100-256k`` / ``:h200-256k`` deployments are not
-available on the current key; raise ``CONTEXT_BUDGET_TOKENS`` only after
-confirming a larger deployment actually serves generation.
+SIE advertises an 8192-token sequence window for the default Qwen3.5-4B and
+Qwen3.8-27B-FP8 profiles. Their generation output cap is 4096 tokens. Keep
+those two limits separate: treating the output cap as the total context window
+starves reasoning models before they emit visible output.
 """
 from __future__ import annotations
 
-CONTEXT_BUDGET_TOKENS = 4096
-GENERATION_RESERVE_TOKENS = 1400
+CONTEXT_BUDGET_TOKENS = 8192
+GENERATION_RESERVE_TOKENS = 4096
 
 
 def estimated_tokens(text: str) -> int:
-    """Rough 4-chars-per-token estimate, deliberately conservative."""
-    return len(text) // 4
+    """Conservative estimate for mixed prose, JSON, and source code.
+
+    The former four-characters-per-token rule undercounted real Qwen prompts
+    containing Rust and escaped tool observations by roughly 30–40%.
+    """
+    return (len(text) * 2 + 4) // 5
