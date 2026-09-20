@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class StrictModel(BaseModel):
@@ -123,6 +123,13 @@ class Flow(StrictModel):
     open_questions: list[str]
     confidence: float = Field(ge=0, le=1)
     evidence: list[str]
+
+    @field_validator("attacker_inputs", "sensitive_operations",
+                     "deployment_assumptions", "open_questions", mode="before")
+    @classmethod
+    def single_text_is_a_one_item_list(cls, value: Any) -> Any:
+        """Canonicalize a common structured-generation scalar/list ambiguity."""
+        return [value] if isinstance(value, str) else value
 
 
 class ProjectMap(StrictModel):

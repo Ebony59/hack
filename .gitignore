@@ -1,5 +1,6 @@
 # Local, machine-specific repo path (each teammate sets their own)
 config.local.yaml
+chrome/
 
 # Secrets / env (holds the SIE API key)
 .env
@@ -10,6 +11,9 @@ runs/
 evaluation/results/
 findings-*.md
 findings-*.json
+
+# Evaluation-pack live results (may contain machine paths / raw model output)
+evaluation/results/
 
 # Python
 __pycache__/

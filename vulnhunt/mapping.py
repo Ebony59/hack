@@ -104,17 +104,34 @@ def _normalize_ids(commit: str, result: MapperResult) -> MapperResult:
     components = [item.model_copy(update={"id": remap[item.id]}) for item in result.components]
     actors = [item.model_copy(update={"id": remap[item.id]}) for item in result.actors]
     assets = [item.model_copy(update={"id": remap[item.id]}) for item in result.assets]
+    component_labels = {item.id for item in result.components}
+    control_labels = {item.id for item in result.controls}
+    uncertainties = list(result.uncertainties)
+    for item in result.entry_points + result.controls:
+        missing = [value for value in item.component_ids if value not in component_labels]
+        if missing:
+            uncertainties.append(
+                f"Dropped unknown component references from {item.name}: {', '.join(missing)}")
+    for item in result.trust_boundaries:
+        missing = [value for value in item.controls if value not in control_labels]
+        if missing:
+            uncertainties.append(
+                f"Dropped unknown control references from {item.name}: {', '.join(missing)}")
     entries = [item.model_copy(update={"id": remap[item.id],
-                                      "component_ids": [remap.get(value, value) for value in item.component_ids]})
+                                      "component_ids": [remap[value] for value in item.component_ids
+                                                        if value in component_labels]})
                for item in result.entry_points]
     boundaries = [item.model_copy(update={"id": remap[item.id],
-                                         "controls": [remap.get(value, value) for value in item.controls]})
+                                         "controls": [remap[value] for value in item.controls
+                                                      if value in control_labels]})
                   for item in result.trust_boundaries]
     controls = [item.model_copy(update={"id": remap[item.id],
-                                       "component_ids": [remap.get(value, value) for value in item.component_ids]})
+                                       "component_ids": [remap[value] for value in item.component_ids
+                                                         if value in component_labels]})
                 for item in result.controls]
     return result.model_copy(update={"components": components, "actors": actors, "assets": assets,
-                                     "entry_points": entries, "trust_boundaries": boundaries, "controls": controls})
+                                     "entry_points": entries, "trust_boundaries": boundaries,
+                                     "controls": controls, "uncertainties": uncertainties})
 
 
 def synthesize(snapshot, evidence, mapper_results: list[MapperResult]) -> ProjectMap:
@@ -150,20 +167,46 @@ class SynthesisTooLarge(RuntimeError):
 SYNTHESIS_RESERVE_TOKENS = 2500
 
 
-def _synthesis_prompt(snapshot, project_map: ProjectMap) -> str:
+def _entity_catalog(project_map: ProjectMap, *, detail_limit: int) -> dict[str, Any]:
+    """Keep synthesis relationships intact while bounding descriptive prose."""
+    def short(value: str) -> str:
+        return value[:detail_limit]
+
+    return {
+        "components": [{"id": item.id, "name": item.name, "kind": item.kind,
+                        "responsibility": short(item.responsibility), "evidence": item.evidence}
+                       for item in project_map.components],
+        "actors": [{"id": item.id, "name": item.name, "kind": item.kind,
+                    "privilege": short(item.privilege), "evidence": item.evidence}
+                   for item in project_map.actors],
+        "assets": [{"id": item.id, "name": item.name, "sensitivity": item.sensitivity,
+                    "storage_or_location": short(item.storage_or_location), "evidence": item.evidence}
+                   for item in project_map.assets],
+        "entry_points": [{"id": item.id, "name": item.name, "kind": item.kind,
+                          "component_ids": item.component_ids, "attacker_inputs": item.attacker_inputs,
+                          "evidence": item.evidence} for item in project_map.entry_points],
+        "trust_boundaries": [{"id": item.id, "name": item.name,
+                              "from_domain": short(item.from_domain),
+                              "to_domain": short(item.to_domain), "controls": item.controls,
+                              "evidence": item.evidence} for item in project_map.trust_boundaries],
+        "controls": [{"id": item.id, "name": item.name, "kind": item.kind,
+                      "component_ids": item.component_ids,
+                      "limitations": [short(value) for value in item.limitations],
+                      "evidence": item.evidence} for item in project_map.controls],
+    }
+
+
+def _synthesis_prompt(snapshot, project_map: ProjectMap, *, excerpt_limit: int = 400,
+                      detail_limit: int = 300) -> str:
     """Build a flow-only prompt without asking the model to echo known data."""
-    entity_catalog = project_map.model_dump(
-        mode="json",
-        exclude={"schema_version", "snapshot_id", "evidence", "flows",
-                 "uncertainties", "disagreements"},
-    )
+    entity_catalog = _entity_catalog(project_map, detail_limit=detail_limit)
     evidence_catalog = [{
         "id": item.id,
         "path": item.path,
         "start_line": item.start_line,
         "end_line": item.end_line,
         "reason": item.reason,
-        "excerpt": item.excerpt[:400],
+        "excerpt": item.excerpt[:excerpt_limit] if excerpt_limit else "",
     } for item in project_map.evidence]
     return f"""You are synthesizing cited end-to-end flows from an already validated project map.
 
@@ -190,8 +233,8 @@ FlowStep fields (all required):
   component_id:entity-id, action:str, inputs:[str], outputs:[str],
   evidence:[evidence-id]
 
-Entity catalog: {json.dumps(entity_catalog, sort_keys=True)}
-Evidence catalog: {json.dumps(evidence_catalog, sort_keys=True)}"""
+Entity catalog: {json.dumps(entity_catalog, sort_keys=True, separators=(',', ':'))}
+Evidence catalog: {json.dumps(evidence_catalog, sort_keys=True, separators=(',', ':'))}"""
 
 
 def run_synthesis(agent: DurableAgent, run_id: str, snapshot, evidence, mapper_results: list[MapperResult],
@@ -200,6 +243,19 @@ def run_synthesis(agent: DurableAgent, run_id: str, snapshot, evidence, mapper_r
     project_map = synthesize(snapshot, evidence, mapper_results)
     prompt = _synthesis_prompt(snapshot, project_map)
     needed = estimated_tokens(prompt) + SYNTHESIS_RESERVE_TOKENS
+    if needed > CONTEXT_BUDGET_TOKENS:
+        # Entity descriptions and evidence reasons still carry the cited map;
+        # omit source excerpts before declaring a large map unsynthesizable.
+        prompt = _synthesis_prompt(snapshot, project_map, excerpt_limit=0)
+        needed = estimated_tokens(prompt) + SYNTHESIS_RESERVE_TOKENS
+    if needed > CONTEXT_BUDGET_TOKENS:
+        prompt = _synthesis_prompt(snapshot, project_map, excerpt_limit=0, detail_limit=120)
+        needed = estimated_tokens(prompt) + SYNTHESIS_RESERVE_TOKENS
+    if needed > CONTEXT_BUDGET_TOKENS:
+        # Last resort for broad maps: retain names, types, all graph edges,
+        # evidence IDs, and evidence reasons, but omit descriptive prose.
+        prompt = _synthesis_prompt(snapshot, project_map, excerpt_limit=0, detail_limit=0)
+        needed = estimated_tokens(prompt) + SYNTHESIS_RESERVE_TOKENS
     if needed > CONTEXT_BUDGET_TOKENS:
         raise SynthesisTooLarge(
             f"synthesis prompt needs ~{needed} tokens but the deployment ceiling is "

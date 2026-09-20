@@ -3,6 +3,9 @@
 requests>=2.31
 PyYAML>=6.0
 numpy>=1.24
-pydantic>=2.0,<3
-# Optional: the official Superlinked SDK (the harness works over raw HTTP without it)
-# sie-sdk
+# Optional for the harness core (works over raw HTTP without it); REQUIRED by the
+# evaluation/ pack, which talks to SIE through the official SDK.
+sie-sdk>=0.1
+# Used by the evaluation/ pack: strict schemas + its test suite.
+pydantic>=2.5
+pytest>=8.0
