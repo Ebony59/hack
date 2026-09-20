@@ -140,6 +140,19 @@ class ProjectMap(StrictModel):
     disagreements: list[str]
 
 
+class FlowSynthesis(StrictModel):
+    """The model-generated portion of a project map.
+
+    Entities and the evidence catalog are merged deterministically before this
+    result is requested, so making the model echo them wastes context and can
+    introduce accidental mutations.
+    """
+    snapshot_id: str
+    flows: list[Flow] = []
+    uncertainties: list[str] = []
+    disagreements: list[str] = []
+
+
 class MapperResult(StrictModel):
     """A mapper's bounded contribution; synthesis is the only flow creator."""
     role: str

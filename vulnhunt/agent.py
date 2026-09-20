@@ -39,6 +39,8 @@ class DurableAgent:
         for step in range(self.max_steps):
             available = CONTEXT_BUDGET_TOKENS - estimated_tokens(conversation)
             if available < self.min_final_reserve:
+                if set(self.tools.evidence) - initial_evidence_ids:
+                    return self._force_final(task, result_type, prompt, initial_evidence_ids)
                 task.status, task.error_message = "inconclusive", (
                     f"context budget exhausted after {step} steps: only ~{available} tokens "
                     f"remain of {CONTEXT_BUDGET_TOKENS}, below the {self.min_final_reserve} "
@@ -65,6 +67,8 @@ class DurableAgent:
                     if navigation_calls >= 3 and request.request.tool != "get_evidence":
                         limit_corrections += 1
                         if limit_corrections > 2:
+                            if set(self.tools.evidence) - initial_evidence_ids:
+                                return self._force_final(task, result_type, prompt, initial_evidence_ids)
                             task.status, task.error_message = "inconclusive", "navigation budget exceeded after correction"
                             return self._finish(task, None)
                         correction = (
@@ -82,6 +86,8 @@ class DurableAgent:
                     if signature in seen_calls:
                         repeated_calls[signature] = repeated_calls.get(signature, 0) + 1
                         if repeated_calls[signature] > 1:
+                            if set(self.tools.evidence) - initial_evidence_ids:
+                                return self._force_final(task, result_type, prompt, initial_evidence_ids)
                             task.status, task.error_message = "inconclusive", "repeated tool call after correction"
                             return self._finish(task, None)
                         correction = (
@@ -131,6 +137,8 @@ class DurableAgent:
             except (ValidationError, ValueError) as exc:
                 task.status, task.error_type, task.error_message = "failed", "ValidationError", str(exc)
                 return self._finish(task, None)
+        if set(self.tools.evidence) - initial_evidence_ids:
+            return self._force_final(task, result_type, prompt, initial_evidence_ids)
         task.status, task.error_message = "inconclusive", "step budget exhausted"
         return self._finish(task, None)
 
@@ -142,7 +150,7 @@ class DurableAgent:
             if evidence_id in initial_evidence_ids:
                 continue
             value = item.model_dump(mode="json")
-            value["excerpt"] = value["excerpt"][:2000]
+            value["excerpt"] = value["excerpt"][:1000]
             evidence.append(value)
         if not evidence:
             task.status, task.error_message = "inconclusive", "tool budget exhausted without evidence"

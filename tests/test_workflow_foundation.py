@@ -33,6 +33,17 @@ def task() -> TaskRecord:
 
 
 class WorkflowFoundationTests(unittest.TestCase):
+    def test_run_store_serializes_models_nested_in_artifact_containers(self):
+        results = [MapperResult(role="product", summary="mapped")]
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(directory)
+
+            store.write_json("artifacts/mapper-results.json", {"results": results})
+
+            payload = store.read_json("artifacts/mapper-results.json")
+        self.assertEqual(payload["results"][0]["role"], "product")
+        self.assertEqual(payload["results"][0]["summary"], "mapped")
+
     def test_symlink_and_absolute_paths_cannot_escape(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
             root, external = Path(directory), Path(outside) / "secret.txt"
