@@ -12,6 +12,9 @@ evaluation/results/
 findings-*.md
 findings-*.json
 
+# Evaluation-pack live results (may contain machine paths / raw model output)
+evaluation/results/
+
 # Python
 __pycache__/
 *.py[cod]
